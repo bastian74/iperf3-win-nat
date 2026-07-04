@@ -210,6 +210,14 @@ What it exposes:
   (its per-stream RTT comes from Linux `TCP_INFO`, which isn't in the Windows
   build). For latency, use **Heartbeat mode** below.
 
+### Path analysis (traceroute / pathping)
+
+**Path** mode runs a hop-by-hop trace to a target and streams it into the log, so
+you can see *where* latency or loss enters the path (your LAN vs ISP vs beyond).
+Choose **tracert** (fast, per-hop round-trip times) or **pathping** (slower, but
+reports per-hop packet-loss %). A latency jump or loss at a specific hop points
+straight at the problem segment.
+
 ### VoIP call simulation (MOS)
 
 **VoIP** mode simulates concurrent VoIP calls and estimates call quality. Pick a

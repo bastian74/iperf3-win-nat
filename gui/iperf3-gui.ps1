@@ -100,6 +100,8 @@ $script:IperfPath = Find-Iperf
                        ToolTip="Continuous ping/link monitor with live round-trip-time graph"/>
           <RadioButton x:Name="rbVoip" Content="VoIP" GroupName="role"
                        ToolTip="Simulate concurrent VoIP calls (UDP) and estimate call quality (MOS)"/>
+          <RadioButton x:Name="rbPath" Content="Path" GroupName="role"
+                       ToolTip="Traceroute / pathping: per-hop latency and loss to locate a problem"/>
           <Label Content="Port:" Margin="16,0,0,0"/>
           <TextBox x:Name="txtPort" Width="70" Text="5201"/>
           <Label Content="Interval (-i):" Margin="16,0,0,0"/>
@@ -188,6 +190,20 @@ $script:IperfPath = Find-Iperf
               <RadioButton x:Name="rbVoipUp" Content="Up" IsChecked="True" GroupName="voipdir"/>
               <RadioButton x:Name="rbVoipDown" Content="Down" GroupName="voipdir"/>
               <RadioButton x:Name="rbVoipBoth" Content="Both" GroupName="voipdir"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Path-only options (disabled unless Path mode) -->
+        <Border x:Name="grpPath" BorderBrush="#2a4a6a" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,0,0,2">
+          <StackPanel>
+            <TextBlock Text="PATH ANALYSIS" Foreground="#6f9fc6" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
+            <StackPanel Orientation="Horizontal">
+              <Label Content="Target:"/>
+              <TextBox x:Name="txtPathHost" Width="160" Text="8.8.8.8"/>
+              <Label Content="Tool:" Margin="12,0,0,0"/>
+              <RadioButton x:Name="rbPathTracert" Content="tracert (fast, per-hop RTT)" IsChecked="True" GroupName="pathtool"/>
+              <RadioButton x:Name="rbPathPing" Content="pathping (slow, per-hop loss)" Margin="10,0,0,0" GroupName="pathtool"/>
             </StackPanel>
           </StackPanel>
         </Border>
@@ -321,9 +337,9 @@ $script:voipCodec  = ''
 # Concurrent load-latency (bufferbloat) pinger - separate from heartbeat
 $script:llControl = $null; $script:llQueue = $null; $script:llPS = $null
 $script:llRS = $null; $script:llHandle = $null
-# Path/pathping worker
-$script:pathControl = $null; $script:pathQueue = $null; $script:pathPS = $null
-$script:pathRS = $null; $script:pathHandle = $null; $script:pathTimer = $null
+# Path (traceroute/pathping) - runs the tool to a temp file and tails it
+$script:pathActive = $false; $script:pathProc = $null
+$script:pathFile = $null; $script:pathBytePos = 0; $script:pathTimer = $null
 
 # Shared background ping worker (used by Heartbeat and by load-latency).
 $script:pingWorker = {
@@ -911,6 +927,77 @@ function Stop-Heartbeat {
     $script:graphUnit = 'mbps'
 }
 
+# --- Path analysis (traceroute / pathping) -------------------------------------
+# Runs the Windows tool to a temp file and tails it into the log, so per-hop
+# latency (tracert) or per-hop loss (pathping) shows where a problem sits.
+function Tail-Path {
+    if (-not $script:pathFile -or -not (Test-Path $script:pathFile)) { return }
+    $text = ''
+    try {
+        $stream = New-Object System.IO.FileStream($script:pathFile, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        [void]$stream.Seek($script:pathBytePos, [System.IO.SeekOrigin]::Begin)
+        $sr = New-Object System.IO.StreamReader($stream)
+        $text = $sr.ReadToEnd(); $script:pathBytePos = $stream.Position
+        $sr.Close(); $stream.Close()
+    } catch { return }
+    if ($text) { $script:txtLog.AppendText($text); $script:txtLog.ScrollToEnd() }
+}
+
+function Start-Path {
+    $target = $txtPathHost.Text.Trim()
+    if (-not $target) {
+        [System.Windows.MessageBox]::Show("Enter a target host or IP for the path trace.",
+            "iperf3-nat GUI", 'OK', 'Warning') | Out-Null
+        return
+    }
+    $tool = if ($rbPathPing.IsChecked) { 'pathping' } else { 'tracert' }
+    # tracert -d = fast per-hop RTT (no DNS); pathping = slower, per-hop loss %.
+    $toolArgs = if ($tool -eq 'pathping') { "-h 30 -q 25 $target" } else { "-d -h 30 $target" }
+
+    $txtLog.Clear(); Reset-Graph
+    $script:pathFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
+                        ('iperf3path_{0}.txt' -f ([guid]::NewGuid().ToString('N'))))
+    $script:pathBytePos = 0
+    '' | Out-File -FilePath $script:pathFile -Encoding utf8
+    Add-Log ("Path: running {0} to {1} ...{2}" -f $tool, $target,
+             $(if ($tool -eq 'pathping') { ' (pathping is slow - up to a minute)' } else { '' }))
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "$env:SystemRoot\System32\cmd.exe"
+    $psi.Arguments = ('/c {0} {1} > "{2}" 2>&1' -f $tool, $toolArgs, $script:pathFile)
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    try { $script:pathProc = [System.Diagnostics.Process]::Start($psi) }
+    catch { Add-Log ("Path: failed to start {0}: {1}" -f $tool, $_.Exception.Message); return }
+
+    $script:pathActive = $true
+    Set-Running $true
+    $lblStatus.Text = "Path trace running ($tool)..."
+    $script:pathTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:pathTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:pathTimer.Add_Tick({
+        Tail-Path
+        if ($script:pathProc -and $script:pathProc.HasExited) {
+            Stop-Path 'Path trace complete.'
+        }
+    })
+    $script:pathTimer.Start()
+}
+
+function Stop-Path([string]$reason = 'Path trace stopped.') {
+    if ($script:pathProc -and -not $script:pathProc.HasExited) { try { $script:pathProc.Kill() } catch { } }
+    Start-Sleep -Milliseconds 60
+    Tail-Path
+    if ($script:pathTimer) { $script:pathTimer.Stop() }
+    $script:pathActive = $false
+    if ($script:pathFile -and (Test-Path $script:pathFile)) {
+        try { Remove-Item $script:pathFile -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    $script:pathProc = $null; $script:pathTimer = $null
+    Set-Running $false
+    $lblStatus.Text = $reason
+}
+
 # --- VoIP modelling + quality (E-model MOS) ------------------------------------
 # Per-call on-wire bitrate (kbps), packet size (bytes), and G.113 impairment
 # factors Ie (equipment) / Bpl (packet-loss robustness) for common codecs.
@@ -1163,8 +1250,8 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     # Group containers (grpClient/grpServer) disable all their children via WPF
     # IsEnabled propagation, so we only toggle the containers + the common controls.
-    foreach ($ctl in @($rbClient,$rbServer,$rbHeartbeat,$rbVoip,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
-                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$grpHeartbeat,$grpVoip,
+    foreach ($ctl in @($rbClient,$rbServer,$rbHeartbeat,$rbVoip,$rbPath,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
+                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$grpHeartbeat,$grpVoip,$grpPath,
                        $chkLoadLatency,$chkCsv,$txtCsvPath,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
@@ -1231,8 +1318,9 @@ function Build-Args {
 
 function Start-Run {
     if ($script:running) { return }
-    # Heartbeat mode is self-contained (no iperf3 process) - hand off and return.
+    # Heartbeat and Path modes are self-contained (no iperf3 process).
     if ($rbHeartbeat.IsChecked) { Start-Heartbeat; return }
+    if ($rbPath.IsChecked) { Start-Path; return }
     $exe = $txtIperf.Text.Trim()
     if (-not $exe -or -not (Test-Path $exe)) {
         [System.Windows.MessageBox]::Show("Could not find iperf3.exe. Use Browse to select it.",
@@ -1360,13 +1448,14 @@ function Start-Run {
 }
 
 function Stop-Run([string]$reason = 'Stopped.') {
-    # Heartbeat mode has no iperf3 process; tear down the monitor instead.
+    # Heartbeat / Path modes have no iperf3 process; tear those down instead.
     if ($script:hbActive) {
         Stop-Heartbeat
         Set-Running $false
         $lblStatus.Text = $reason
         return
     }
+    if ($script:pathActive) { Stop-Path $reason; return }
     if ($script:proc -and -not $script:proc.HasExited) {
         try { $script:proc.Kill() } catch { }
     }
@@ -1460,11 +1549,13 @@ $script:updateRole = {
     $isServer = $rbServer.IsChecked
     $isHb     = $rbHeartbeat.IsChecked
     $isVoip   = $rbVoip.IsChecked
+    $isPath   = $rbPath.IsChecked
     $grpClient.IsEnabled    = $isClient          # CLIENT OPTIONS
     $grpServer.IsEnabled    = $isServer          # SERVER OPTIONS
     $grpHeartbeat.IsEnabled = $isHb              # HEARTBEAT
     $grpVoip.IsEnabled      = $isVoip            # VoIP
-    # Port/Interval/NAT are iperf3 settings - used by client/server/VoIP, not heartbeat.
+    $grpPath.IsEnabled      = $isPath            # PATH
+    # Port/Interval/NAT are iperf3 settings - used by client/server/VoIP, not heartbeat/path.
     foreach ($c in @($txtPort, $txtInterval, $chkNat)) { $c.IsEnabled = ($isClient -or $isServer -or $isVoip) }
     # Bufferbloat probe only makes sense during a throughput/VoIP test.
     $chkLoadLatency.IsEnabled = ($isClient -or $isVoip)
@@ -1473,6 +1564,7 @@ $rbClient.Add_Checked($script:updateRole)
 $rbServer.Add_Checked($script:updateRole)
 $rbHeartbeat.Add_Checked($script:updateRole)
 $rbVoip.Add_Checked($script:updateRole)
+$rbPath.Add_Checked($script:updateRole)
 & $script:updateRole   # apply once at startup (default is client mode)
 
 $win.Add_Closing({
