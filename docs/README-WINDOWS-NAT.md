@@ -175,11 +175,48 @@ What it exposes:
 * **Mode** — Client or Server
 * **Host**, **Port**, **Protocol** (TCP/UDP)
 * **Duration** (`-t`), **Streams** (`-P`), **Interval** (`-i`), **Bitrate**
-  (`-b`), **Window** (`-w`)
+  (`-b`), **Length/packet size** (`-l`), **Window** (`-w`), **DSCP** (`--dscp`)
 * **Reverse** (`-R`), **Bidirectional** (`--bidir`), **NAT mode** (`--nat`)
 * **Auto-forward (UPnP)** — server-mode only; see below
 * A **Public IP** button — look up this machine's internet-visible address
 * An **Extra args** box for anything else (passed through verbatim)
+
+### Reading the live graph and stats
+
+* Each **direction is a separate line**: cyan **TX** (this machine sending) and
+  amber **RX** (this machine receiving), with a legend on the plot. A one-way test
+  shows a single line; a **bidirectional** (`--bidir`) test shows both at once; a
+  **reverse** (`-R`) test shows RX. On a server the labels follow the same rule
+  (an upload test to the server shows RX).
+* **Current / Average / Peak are reported per direction**, one row each, colour-
+  matched to the graph line.
+* The graph **resets at the start of each test**, so running several tests against
+  a long-lived server no longer smears them into one tangled plot — you always see
+  the current test.
+* For **UDP** the stats row and log also show **jitter and packet loss** (measured
+  on the receiving side); for **TCP** they show **retransmits**. The end-of-test
+  summary logs every direction (sent/received, and the reverse pair for bidir).
+* Note: iperf3 is a throughput tool and does **not** measure round-trip latency,
+  so the GUI can't show it. Use `ping`/`pathping` alongside if you need latency.
+
+### QoS / DSCP marking on Windows (important caveat)
+
+The **DSCP** box passes `--dscp` (accepts names like `EF`, `CS5`, `AF11` or a
+number 0-63) so iperf3 asks the socket to mark packets. **However, Windows
+usually strips application-set DSCP/ToS values by default** — the socket call
+succeeds but the bits never reach the wire. This is a Windows policy, not an
+iperf3 limitation. To actually mark packets on Windows you generally need one of:
+
+* a **Group Policy QoS Policy** (Computer/User Config → Policy-based QoS) that
+  matches the app or port and sets the DSCP value — the recommended, supported
+  way; or
+* the legacy registry override
+  `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\DisableUserTOSSetting = 0`
+  (a reboot is required, and it is disabled by default for a reason).
+
+So treat the DSCP box as "request marking"; verify with a capture (Wireshark) or
+switch statistics whether the bits actually survive on your network. On Linux/BSD
+peers the same `--dscp` works without these hoops.
 
 ### Public IP button
 

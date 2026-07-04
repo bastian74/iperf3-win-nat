@@ -132,10 +132,13 @@ $script:IperfPath = Find-Iperf
         </StackPanel>
         <StackPanel Grid.Row="2" Grid.Column="2" Grid.ColumnSpan="4" Orientation="Horizontal" Margin="16,0,0,0">
           <Label Content="Bitrate (-b):"/>
-          <TextBox x:Name="txtBitrate" Width="70" Text=""/>
-          <Label Content="(e.g. 50M; UDP/capped TCP)" Foreground="#8080a0"/>
-          <Label Content="Window (-w):" Margin="12,0,0,0"/>
-          <TextBox x:Name="txtWindow" Width="60" Text=""/>
+          <TextBox x:Name="txtBitrate" Width="58" Text="" ToolTip="Target rate, e.g. 50M. UDP or capped TCP."/>
+          <Label Content="Len (-l):" Margin="10,0,0,0"/>
+          <TextBox x:Name="txtLen" Width="58" Text="" ToolTip="Packet/buffer size: UDP datagram or TCP read/write size, e.g. 1400 or 128K"/>
+          <Label Content="Window (-w):" Margin="10,0,0,0"/>
+          <TextBox x:Name="txtWindow" Width="58" Text=""/>
+          <Label Content="DSCP:" Margin="10,0,0,0"/>
+          <TextBox x:Name="txtDscp" Width="52" Text="" ToolTip="QoS marking, e.g. EF, CS5, AF11 or 0-63. Note: Windows often ignores socket DSCP (see docs)."/>
         </StackPanel>
 
         <!-- line 3: checkboxes + format + extra -->
@@ -175,18 +178,10 @@ $script:IperfPath = Find-Iperf
       <Canvas x:Name="graph" ClipToBounds="True"/>
     </Border>
 
-    <!-- Row 3: live stats -->
+    <!-- Row 3: live stats (per direction, filled dynamically) -->
     <Border Grid.Row="3" Background="#26263440" BorderBrush="#3a3a52" BorderThickness="1"
-            CornerRadius="4" Padding="8,4" Margin="0,6,0,6">
-      <StackPanel Orientation="Horizontal">
-        <TextBlock Foreground="#8080a0" Text="Current: "/>
-        <TextBlock x:Name="lblCur" Foreground="#4fc3f7" FontWeight="Bold" Text="-" Width="130"/>
-        <TextBlock Foreground="#8080a0" Text="Average: "/>
-        <TextBlock x:Name="lblAvg" Foreground="#81c784" FontWeight="Bold" Text="-" Width="130"/>
-        <TextBlock Foreground="#8080a0" Text="Peak: "/>
-        <TextBlock x:Name="lblPeak" Foreground="#ffb74d" FontWeight="Bold" Text="-" Width="130"/>
-        <TextBlock x:Name="lblExtra" Foreground="#b0b0c8" Text=""/>
-      </StackPanel>
+            CornerRadius="4" Padding="8,4" Margin="0,6,0,6" MinHeight="28">
+      <StackPanel x:Name="spStats" Orientation="Vertical"/>
     </Border>
 
     <!-- Row 4: log -->
@@ -201,10 +196,11 @@ $script:IperfPath = Find-Iperf
     <!-- Row 5: status bar -->
     <Grid Grid.Row="5">
       <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
       <TextBlock Grid.Column="0" x:Name="lblStatus" Foreground="#8080a0" Text="Idle." VerticalAlignment="Center"/>
-      <TextBlock Grid.Column="1" x:Name="lblCmd" Foreground="#606078" VerticalAlignment="Center"
+      <TextBlock Grid.Column="1" x:Name="lblExtra" Foreground="#b0b0c8" Margin="16,0,0,0" VerticalAlignment="Center"/>
+      <TextBlock Grid.Column="2" x:Name="lblCmd" Foreground="#606078" VerticalAlignment="Center"
                  FontFamily="Consolas" FontSize="10"/>
     </Grid>
   </Grid>
@@ -228,9 +224,7 @@ $script:proc      = $null
 $script:logFile   = $null
 $script:bytePos   = 0
 $script:buffer    = ''
-$script:points    = New-Object System.Collections.Generic.List[object]
-$script:peak      = 0.0
-$script:sumV      = 0.0
+$script:series    = [ordered]@{}   # direction label (TX/RX) -> series object with its own points/stats
 $script:running   = $false
 $script:timer     = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(200)
@@ -358,14 +352,62 @@ function Resolve-AndShowPublicIP {
 }
 
 function Reset-Graph {
-    $script:points.Clear()
-    $script:peak = 0.0
-    $script:sumV = 0.0
+    $script:series = [ordered]@{}
     $script:graph.Children.Clear()
-    $script:lblCur.Text  = '-'
-    $script:lblAvg.Text  = '-'
-    $script:lblPeak.Text = '-'
-    $script:lblExtra.Text = ''
+    $script:spStats.Children.Clear()
+}
+
+function Get-DirColor([string]$label) {
+    switch ($label) {
+        'TX' { return [Windows.Media.Color]::FromRgb(79,195,247) }   # cyan  - this host sending
+        'RX' { return [Windows.Media.Color]::FromRgb(255,183,77) }   # amber - this host receiving
+        default { return [Windows.Media.Color]::FromRgb(129,199,132) }
+    }
+}
+
+function Get-Series([string]$label) {
+    if (-not $script:series.Contains($label)) {
+        $script:series[$label] = [pscustomobject]@{
+            Label  = $label
+            Color  = (Get-DirColor $label)
+            Points = (New-Object System.Collections.Generic.List[object])
+            Peak   = 0.0; Sum = 0.0; Count = 0; Last = 0.0; Extra = ''
+        }
+    }
+    return $script:series[$label]
+}
+
+function Add-Sample([string]$label, [double]$t, [double]$mbps, [string]$extra = '') {
+    $ser = Get-Series $label
+    $ser.Points.Add([pscustomobject]@{ T = $t; V = $mbps })
+    if ($mbps -gt $ser.Peak) { $ser.Peak = $mbps }
+    $ser.Sum += $mbps; $ser.Count += 1; $ser.Last = $mbps; $ser.Extra = $extra
+    Redraw-Graph
+    Update-Stats
+}
+
+function Update-Stats {
+    $sp = $script:spStats
+    $sp.Children.Clear()
+    $grey = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromRgb(208,208,224))
+    foreach ($k in $script:series.Keys) {
+        $ser = $script:series[$k]
+        $row = New-Object Windows.Controls.StackPanel
+        $row.Orientation = 'Horizontal'
+        $lab = New-Object Windows.Controls.TextBlock
+        $lab.Text = ("{0}: " -f $ser.Label)
+        $lab.Foreground = (New-Object Windows.Media.SolidColorBrush $ser.Color)
+        $lab.FontWeight = 'Bold'; $lab.Width = 40
+        [void]$row.Children.Add($lab)
+        $avg = if ($ser.Count -gt 0) { $ser.Sum / $ser.Count } else { 0 }
+        $val = New-Object Windows.Controls.TextBlock
+        $val.Foreground = $grey
+        $extra = if ($ser.Extra) { "     $($ser.Extra)" } else { '' }
+        $val.Text = ("Current {0}     Average {1}     Peak {2}{3}" -f `
+                     (Format-Rate $ser.Last), (Format-Rate $avg), (Format-Rate $ser.Peak), $extra)
+        [void]$row.Children.Add($val)
+        [void]$sp.Children.Add($row)
+    }
 }
 
 function Redraw-Graph {
@@ -379,15 +421,20 @@ function Redraw-Graph {
     $plotH = $h - $top - $bottom
     if ($plotW -le 0 -or $plotH -le 0) { return }
 
-    # scales
-    $maxV = [Math]::Max($script:peak, 1.0)
+    # global vertical/horizontal scale across all series
+    $maxV = 1.0; $maxT = 1.0
+    foreach ($k in $script:series.Keys) {
+        $ser = $script:series[$k]
+        if ($ser.Peak -gt $maxV) { $maxV = $ser.Peak }
+        if ($ser.Points.Count -gt 0) {
+            $lt = $ser.Points[$ser.Points.Count - 1].T
+            if ($lt -gt $maxT) { $maxT = $lt }
+        }
+    }
     # round the axis max up to something readable
     $mag = [Math]::Pow(10, [Math]::Floor([Math]::Log10($maxV)))
     $niceMax = [Math]::Ceiling($maxV / $mag) * $mag
     if ($niceMax -le 0) { $niceMax = 1 }
-
-    $maxT = 1.0
-    if ($script:points.Count -gt 0) { $maxT = [Math]::Max($script:points[$script:points.Count-1].T, 1.0) }
 
     # gridlines + Y labels
     $gridBrush = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromRgb(48,48,68))
@@ -417,47 +464,54 @@ function Redraw-Graph {
         [void]$c.Children.Add($tb)
     }
 
-    if ($script:points.Count -lt 1) { return }
-
-    # polyline
-    $pl = New-Object Windows.Shapes.Polyline
-    $pl.Stroke = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromRgb(79,195,247))
-    $pl.StrokeThickness = 2
-    $pts = New-Object Windows.Media.PointCollection
-    foreach ($p in $script:points) {
-        $x = $left + ($p.T / $maxT) * $plotW
-        $y = $top + $plotH - ($p.V / $niceMax) * $plotH
-        $pts.Add((New-Object Windows.Point $x, $y))
-    }
-    $pl.Points = $pts
-    [void]$c.Children.Add($pl)
-
-    # fill area under the line (subtle)
-    if ($script:points.Count -ge 2) {
-        $poly = New-Object Windows.Shapes.Polygon
-        $poly.Fill = New-Object Windows.Media.SolidColorBrush ([Windows.Media.Color]::FromArgb(40,79,195,247))
-        $fpts = New-Object Windows.Media.PointCollection
-        $fpts.Add((New-Object Windows.Point ($left), ($top + $plotH)))
-        foreach ($p in $script:points) {
+    # one polyline per direction series, plus a small legend
+    $legendRow = 0
+    foreach ($k in $script:series.Keys) {
+        $ser = $script:series[$k]
+        if ($ser.Points.Count -lt 1) { continue }
+        $brush = New-Object Windows.Media.SolidColorBrush $ser.Color
+        $pl = New-Object Windows.Shapes.Polyline
+        $pl.Stroke = $brush; $pl.StrokeThickness = 2
+        $pts = New-Object Windows.Media.PointCollection
+        foreach ($p in $ser.Points) {
             $x = $left + ($p.T / $maxT) * $plotW
             $y = $top + $plotH - ($p.V / $niceMax) * $plotH
-            $fpts.Add((New-Object Windows.Point $x, $y))
+            $pts.Add((New-Object Windows.Point $x, $y))
         }
-        $fpts.Add((New-Object Windows.Point ($left + ($maxT/$maxT)*$plotW), ($top + $plotH)))
-        $poly.Points = $fpts
-        [void]$c.Children.Add($poly)
+        $pl.Points = $pts
+        [void]$c.Children.Add($pl)
+
+        # legend swatch + label (top-left of plot area)
+        $ly = $top + 4 + ($legendRow * 16)
+        $sw = New-Object Windows.Shapes.Line
+        $sw.X1 = $left + 8; $sw.X2 = $left + 26; $sw.Y1 = $ly + 8; $sw.Y2 = $ly + 8
+        $sw.Stroke = $brush; $sw.StrokeThickness = 3
+        [void]$c.Children.Add($sw)
+        $lt = New-Object Windows.Controls.TextBlock
+        $lt.Text = $ser.Label; $lt.Foreground = $brush; $lt.FontSize = 11; $lt.FontWeight = 'Bold'
+        [Windows.Controls.Canvas]::SetLeft($lt, $left + 30)
+        [Windows.Controls.Canvas]::SetTop($lt, $ly)
+        [void]$c.Children.Add($lt)
+        $legendRow += 1
     }
 }
 
-function Add-Point([double]$t, [double]$mbps, [string]$extra = '') {
-    $script:points.Add([pscustomobject]@{ T = $t; V = $mbps })
-    if ($mbps -gt $script:peak) { $script:peak = $mbps }
-    $script:sumV += $mbps
-    $script:lblCur.Text  = Format-Rate $mbps
-    $script:lblAvg.Text  = Format-Rate ($script:sumV / $script:points.Count)
-    $script:lblPeak.Text = Format-Rate $script:peak
-    if ($extra) { $script:lblExtra.Text = $extra }
-    Redraw-Graph
+# Direction label for a "sum" object: TX = this host is sending, RX = receiving.
+function Dir-Label($sumObj) {
+    if ($sumObj -and ($sumObj.PSObject.Properties.Name -contains 'sender') -and $sumObj.sender) { return 'TX' }
+    return 'RX'
+}
+
+# Extra per-interval detail: jitter/loss for UDP, retransmits for TCP.
+function Sum-Extra($s) {
+    if ($s.PSObject.Properties.Name -contains 'jitter_ms' -and $null -ne $s.jitter_ms) {
+        return ('jitter {0:N2} ms, loss {1:N1}% ({2}/{3})' -f `
+                [double]$s.jitter_ms, [double]$s.lost_percent, [int]$s.lost_packets, [int]$s.packets)
+    }
+    if ($s.PSObject.Properties.Name -contains 'retransmits' -and $null -ne $s.retransmits) {
+        return ('retransmits {0}' -f [int]$s.retransmits)
+    }
+    return ''
 }
 
 function Process-Line([string]$line) {
@@ -474,40 +528,54 @@ function Process-Line([string]$line) {
     if ($obj.PSObject.Properties.Name -contains 'event') { $evt = $obj.event }
     switch ($evt) {
         'start' {
+            # Each test begins with a 'start' event. Reset the graph so successive
+            # runs against a server don't smear together into one messy plot.
+            Reset-Graph
             $d = $obj.data
             if ($d.PSObject.Properties.Name -contains 'connecting_to') {
                 Add-Log ("Connecting to {0} port {1}" -f $d.connecting_to.host, $d.connecting_to.port)
             }
             if ($d.PSObject.Properties.Name -contains 'test_start') {
                 $ts = $d.test_start
-                Add-Log ("Test start: {0}, {1} stream(s), reverse={2}, bidir={3}" -f `
+                Add-Log ("--- Test start: {0}, {1} stream(s), reverse={2}, bidir={3} ---" -f `
                          $ts.protocol, $ts.num_streams, $ts.reverse, $ts.bidir)
             }
         }
         'interval' {
-            $s = $obj.data.sum
+            $d = $obj.data
+            $logbits = @()
+            # primary direction
+            $s = $d.sum
+            $lbl = Dir-Label $s
             $mbps = [double]$s.bits_per_second / 1e6
-            $extra = ''
-            if ($s.PSObject.Properties.Name -contains 'jitter_ms') {
-                $extra = ('jitter {0:N3} ms, lost {1:N1}%' -f [double]$s.jitter_ms, [double]$s.lost_percent)
+            Add-Sample $lbl ([double]$s.end) $mbps (Sum-Extra $s)
+            $logbits += ("{0} {1}" -f $lbl, (Format-Rate $mbps))
+            # reverse direction (bidirectional tests only)
+            if ($d.PSObject.Properties.Name -contains 'sum_bidir_reverse' -and $d.sum_bidir_reverse) {
+                $r = $d.sum_bidir_reverse
+                $lbl2 = Dir-Label $r
+                $mbps2 = [double]$r.bits_per_second / 1e6
+                Add-Sample $lbl2 ([double]$r.end) $mbps2 (Sum-Extra $r)
+                $logbits += ("{0} {1}" -f $lbl2, (Format-Rate $mbps2))
             }
-            if ($s.PSObject.Properties.Name -contains 'retransmits' -and $null -ne $s.retransmits) {
-                $extra = ('retransmits: {0}' -f $s.retransmits)
-            }
-            Add-Point ([double]$s.end) $mbps $extra
-            Add-Log ("[{0,6:N1}s] {1}" -f [double]$s.end, (Format-Rate $mbps))
+            Add-Log ("[{0,5:N1}s]  {1}" -f [double]$s.end, ($logbits -join '   '))
         }
         'end' {
             $d = $obj.data
-            if ($d.PSObject.Properties.Name -contains 'sum_sent') {
-                Add-Log ("SUMMARY  sent: {0}" -f (Format-Rate ([double]$d.sum_sent.bits_per_second/1e6)))
-            }
-            if ($d.PSObject.Properties.Name -contains 'sum_received') {
-                Add-Log ("SUMMARY  recv: {0}" -f (Format-Rate ([double]$d.sum_received.bits_per_second/1e6)))
+            Add-Log "--- Test complete ---"
+            foreach ($pair in @(
+                @('sum_sent','sent (TX)'), @('sum_received','received (RX)'),
+                @('sum_sent_bidir_reverse','sent reverse'), @('sum_received_bidir_reverse','received reverse'))) {
+                $key = $pair[0]; $name = $pair[1]
+                if ($d.PSObject.Properties.Name -contains $key -and $d.$key) {
+                    $sm = $d.$key
+                    $x = Sum-Extra $sm
+                    Add-Log ("SUMMARY {0,-16} {1}{2}" -f $name, (Format-Rate ([double]$sm.bits_per_second/1e6)),
+                             $(if ($x) { "   $x" } else { '' }))
+                }
             }
         }
         default {
-            # unknown JSON (e.g. an error object) - dump compact
             Add-Log $line
         }
     }
@@ -540,14 +608,14 @@ function Set-Running([bool]$on) {
     $script:btnRun.IsEnabled  = -not $on
     $script:btnStop.IsEnabled = $on
     foreach ($ctl in @($rbClient,$rbServer,$rbTcp,$rbUdp,$txtHost,$txtPort,$txtTime,
-                       $txtParallel,$txtInterval,$txtBitrate,$txtWindow,$chkReverse,
+                       $txtParallel,$txtInterval,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,
                        $chkBidir,$chkNat,$chkUpnp,$txtExtra,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
     if (-not $on) {
         # Re-apply role-based enable/disable (client-only vs server-only fields)
         $isClient = $rbClient.IsChecked
-        foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtWindow,$chkReverse,$chkBidir)) {
+        foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,$chkBidir)) {
             $ctl.IsEnabled = $isClient
         }
         $chkUpnp.IsEnabled = -not $isClient
@@ -571,7 +639,9 @@ function Build-Args {
         if ($txtTime.Text.Trim())     { $a.Add('-t'); $a.Add($txtTime.Text.Trim()) }
         if ($txtParallel.Text.Trim()) { $a.Add('-P'); $a.Add($txtParallel.Text.Trim()) }
         if ($txtBitrate.Text.Trim())  { $a.Add('-b'); $a.Add($txtBitrate.Text.Trim()) }
+        if ($txtLen.Text.Trim())      { $a.Add('-l'); $a.Add($txtLen.Text.Trim()) }
         if ($txtWindow.Text.Trim())   { $a.Add('-w'); $a.Add($txtWindow.Text.Trim()) }
+        if ($txtDscp.Text.Trim())     { $a.Add('--dscp'); $a.Add($txtDscp.Text.Trim()) }
         if ($chkReverse.IsChecked)    { $a.Add('-R') }
         if ($chkBidir.IsChecked)      { $a.Add('--bidir') }
     }
@@ -733,7 +803,7 @@ $graph.Add_SizeChanged({ Redraw-Graph })
 # Enable/disable client-only fields when role changes
 $updateRole = {
     $isClient = $rbClient.IsChecked
-    foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtWindow,$chkReverse,$chkBidir)) {
+    foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,$chkBidir)) {
         $ctl.IsEnabled = $isClient
     }
     $chkUpnp.IsEnabled = -not $isClient   # UPnP auto-forward is a server-side action
