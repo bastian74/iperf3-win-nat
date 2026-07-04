@@ -10,6 +10,11 @@
 
     The script locates iperf3.exe automatically (same folder, ../src, or the
     dist/ build); use the Browse button to point at a specific binary.
+
+    Server mode can optionally auto-forward its port on the router via UPnP IGD
+    (the built-in Windows HNetCfg.NATUPnP COM API - no extra dependency), so a
+    server behind NAT can become reachable without a manual port-forward. The
+    mapping is removed again when the server is stopped or the GUI closes.
 #>
 
 Set-StrictMode -Version Latest
@@ -136,8 +141,9 @@ $script:IperfPath = Find-Iperf
         <!-- line 3: checkboxes + format + extra -->
         <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
           <CheckBox x:Name="chkReverse" Content="Reverse (-R)"/>
-          <CheckBox x:Name="chkBidir" Content="Bidirectional (--bidir)"/>
-          <CheckBox x:Name="chkNat" Content="NAT mode (--nat)" IsChecked="True"/>
+          <CheckBox x:Name="chkBidir" Content="Bidir (--bidir)"/>
+          <CheckBox x:Name="chkNat" Content="NAT (--nat)" IsChecked="True"/>
+          <CheckBox x:Name="chkUpnp" Content="Auto-forward (UPnP)" ToolTip="Server mode: ask the router to forward this port via UPnP"/>
         </StackPanel>
         <StackPanel Grid.Row="4" Grid.Column="3" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="16,0,0,0">
           <Label Content="Extra args:"/>
@@ -223,6 +229,8 @@ $script:sumV      = 0.0
 $script:running   = $false
 $script:timer     = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(200)
+$script:upnpMappings   = @()      # list of @{Port=;Protocol=} we created on the router
+$script:upnpExternalIp = $null    # WAN IP reported by the IGD, if any
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -235,6 +243,74 @@ function Add-Log([string]$text, [string]$color = '#c0c0d0') {
 function Format-Rate([double]$mbps) {
     if ($mbps -ge 1000) { return ('{0:N2} Gbit/s' -f ($mbps / 1000)) }
     return ('{0:N1} Mbit/s' -f $mbps)
+}
+
+# --- UPnP IGD (router port-forwarding) via the built-in Windows COM API --------
+# No external dependency: HNetCfg.NATUPnP ships with Windows. Requires the router
+# to have UPnP IGD enabled; if not, we degrade gracefully to a warning.
+
+function Get-LocalIPv4 {
+    # Determine the LAN IPv4 of the interface that reaches the default gateway,
+    # without sending anything (UDP "connect" only selects the local endpoint).
+    try {
+        $s = New-Object System.Net.Sockets.Socket(
+            [System.Net.Sockets.AddressFamily]::InterNetwork,
+            [System.Net.Sockets.SocketType]::Dgram,
+            [System.Net.Sockets.ProtocolType]::Udp)
+        $s.Connect('8.8.8.8', 65530)
+        $ip = ([System.Net.IPEndPoint]$s.LocalEndPoint).Address.ToString()
+        $s.Close()
+        return $ip
+    } catch { return $null }
+}
+
+function Add-UpnpMapping {
+    param([int]$Port, [string[]]$Protocols, [string]$LocalIP, [string]$Desc)
+    $res = [pscustomobject]@{ Ok = $false; External = $null; Mapped = @(); Error = $null }
+    $nat = $null
+    try { $nat = New-Object -ComObject HNetCfg.NATUPnP }
+    catch { $res.Error = "UPnP COM interface unavailable: $($_.Exception.Message)"; return $res }
+
+    $coll = $null
+    try { $coll = $nat.StaticPortMappingCollection } catch { }
+    if ($null -eq $coll) {
+        $res.Error = "no UPnP IGD device found (router UPnP disabled or unsupported)"
+        return $res
+    }
+
+    $mapped = New-Object System.Collections.Generic.List[object]
+    foreach ($proto in $Protocols) {
+        try {
+            try { $coll.Remove($Port, $proto) } catch { }   # clear any stale mapping
+            $m = $coll.Add($Port, $proto, $Port, $LocalIP, $true, $Desc)
+            [void]$mapped.Add(@{ Port = $Port; Protocol = $proto })
+            if (-not $res.External) { try { $res.External = $m.ExternalIPAddress } catch { } }
+        } catch {
+            $res.Error = "failed to map $proto/$Port ($($_.Exception.Message))"
+        }
+    }
+    $res.Mapped = $mapped
+    $res.Ok = ($mapped.Count -gt 0)
+    if ($res.Ok -and -not $res.External) {
+        try { foreach ($e in $coll) { if ($e.ExternalIPAddress) { $res.External = $e.ExternalIPAddress; break } } } catch { }
+    }
+    return $res
+}
+
+function Remove-UpnpMappings {
+    if (-not $script:upnpMappings -or @($script:upnpMappings).Count -eq 0) { return }
+    try {
+        $nat  = New-Object -ComObject HNetCfg.NATUPnP
+        $coll = $nat.StaticPortMappingCollection
+        if ($coll) {
+            foreach ($mp in $script:upnpMappings) {
+                try { $coll.Remove([int]$mp.Port, [string]$mp.Protocol) } catch { }
+            }
+            Add-Log ("UPnP: removed router port mapping(s).")
+        }
+    } catch { }
+    $script:upnpMappings   = @()
+    $script:upnpExternalIp = $null
 }
 
 function Reset-Graph {
@@ -421,8 +497,16 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     foreach ($ctl in @($rbClient,$rbServer,$rbTcp,$rbUdp,$txtHost,$txtPort,$txtTime,
                        $txtParallel,$txtInterval,$txtBitrate,$txtWindow,$chkReverse,
-                       $chkBidir,$chkNat,$txtExtra,$txtIperf,$btnBrowse)) {
+                       $chkBidir,$chkNat,$chkUpnp,$txtExtra,$txtIperf,$btnBrowse)) {
         $ctl.IsEnabled = -not $on
+    }
+    if (-not $on) {
+        # Re-apply role-based enable/disable (client-only vs server-only fields)
+        $isClient = $rbClient.IsChecked
+        foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtWindow,$chkReverse,$chkBidir)) {
+            $ctl.IsEnabled = $isClient
+        }
+        $chkUpnp.IsEnabled = -not $isClient
     }
 }
 
@@ -498,6 +582,38 @@ function Start-Run {
     }
     Add-Log ("> " + $exe + " " + $psi.Arguments)
     Set-Running $true
+
+    # Server mode: optionally ask the router to forward this port via UPnP so a
+    # server behind NAT becomes reachable without a manual port-forward.
+    if ($rbServer.IsChecked -and $chkUpnp.IsChecked) {
+        $port = 5201
+        [void][int]::TryParse($txtPort.Text.Trim(), [ref]$port)
+        $localIP = Get-LocalIPv4
+        if (-not $localIP) {
+            Add-Log "UPnP: could not determine this machine's LAN IP; skipping port mapping."
+        } else {
+            $protos = @('TCP')
+            if ($rbUdp.IsChecked) { $protos += 'UDP' }   # UDP tests also need the UDP port
+            Add-Log ("UPnP: requesting router forward of port {0}/{1} -> {2} ..." -f $port, ($protos -join '+'), $localIP)
+            $lblStatus.Text = 'Requesting UPnP port mapping from router…'
+            $u = Add-UpnpMapping -Port $port -Protocols $protos -LocalIP $localIP -Desc 'iperf3-nat'
+            if ($u.Ok) {
+                $script:upnpMappings   = $u.Mapped
+                $script:upnpExternalIp = $u.External
+                if ($u.External) {
+                    Add-Log ("UPnP: SUCCESS - clients should connect to  {0}:{1}   (WAN -> {2}:{1})" -f $u.External, $port, $localIP)
+                    $lblExtra.Text = ("Public: {0}:{1}" -f $u.External, $port)
+                } else {
+                    Add-Log "UPnP: mapping created on the router (external IP not reported)."
+                }
+            } else {
+                Add-Log ("UPnP: could not create mapping - " + $u.Error + ".")
+                Add-Log ("UPnP: continuing without auto-forward; forward TCP{0} port {1} to {2} manually if the server is behind NAT." -f `
+                         ($(if ($rbUdp.IsChecked) {'/UDP'} else {''})), $port, $localIP)
+            }
+        }
+    }
+
     $lblStatus.Text = if ($rbServer.IsChecked) { 'Server running - waiting for clients…' } else { 'Test running…' }
     $script:timer.Start()
 }
@@ -514,6 +630,7 @@ function Stop-Run([string]$reason = 'Stopped.') {
         try { $err = $script:proc.StandardError.ReadToEnd() } catch { }
         if ($err) { Add-Log $err }
     }
+    Remove-UpnpMappings
     Set-Running $false
     $lblStatus.Text = $reason
     if ($script:logFile -and (Test-Path $script:logFile)) {
@@ -553,9 +670,11 @@ $updateRole = {
     foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtWindow,$chkReverse,$chkBidir)) {
         $ctl.IsEnabled = $isClient
     }
+    $chkUpnp.IsEnabled = -not $isClient   # UPnP auto-forward is a server-side action
 }
 $rbClient.Add_Checked($updateRole)
 $rbServer.Add_Checked($updateRole)
+& $updateRole   # apply once at startup (default is client mode -> UPnP disabled)
 
 $win.Add_Closing({
     if ($script:running) { Stop-Run 'Closing.' }

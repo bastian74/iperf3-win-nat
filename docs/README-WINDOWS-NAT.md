@@ -177,7 +177,31 @@ What it exposes:
 * **Duration** (`-t`), **Streams** (`-P`), **Interval** (`-i`), **Bitrate**
   (`-b`), **Window** (`-w`)
 * **Reverse** (`-R`), **Bidirectional** (`--bidir`), **NAT mode** (`--nat`)
+* **Auto-forward (UPnP)** — server-mode only; see below
 * An **Extra args** box for anything else (passed through verbatim)
+
+### Auto-forward (UPnP) — for a server that *is* behind NAT
+
+Normally iperf3's server has to be on the reachable side (one forwarded port).
+The GUI's **Auto-forward (UPnP)** checkbox lets a server behind NAT open that port
+itself: when you start the server with it ticked, the GUI asks your router — via
+the UPnP IGD protocol built into Windows (`HNetCfg.NATUPnP`, no extra software) —
+to forward the server port to this machine, and logs the **public IP** clients
+should connect to. When you Stop the server (or close the GUI) the mapping is
+removed again. If UDP is selected, both the TCP and UDP port are mapped (the
+control channel is always TCP).
+
+Caveats, stated honestly:
+
+* **The router must have UPnP IGD enabled.** Many home routers do by default;
+  many corporate/campus networks and all carrier-grade NAT deliberately do not.
+  If it's unavailable the GUI logs a clear warning and the server still runs — you
+  just have to port-forward manually (or you're out of luck behind CGNAT).
+* UPnP maps the **router**, not the local Windows Firewall. If Windows prompts to
+  allow `iperf3.exe`, still allow it (or add an inbound rule for the port).
+* This is available in the **GUI server mode only**. The headless `iperf3.exe`
+  itself does not do UPnP; that would need a UPnP C library linked into the
+  binary. Ask if you need the CLI to do it too.
 
 While a test runs it shows the live per-interval line graph plus current /
 average / peak counters and a scrolling log; UDP tests additionally show jitter
