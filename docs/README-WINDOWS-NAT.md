@@ -171,9 +171,9 @@ It auto-locates `iperf3.exe` (same folder, `..\src`, or the `dist` build); use
 self-contained bundle.
 
 The options are grouped by role: a **Common** row (Mode, Port, Interval, NAT), a
-**CLIENT OPTIONS** box, and a **SERVER OPTIONS** box. Selecting Client or Server
-enables the matching box and greys out the other, so you can't set an option that
-doesn't apply to the current role. In particular **Protocol (TCP/UDP) is a client
+**CLIENT OPTIONS** box, a **SERVER OPTIONS** box, and a **HEARTBEAT** box.
+Selecting Client, Server, or Heartbeat enables the matching box and greys out the
+others, so you can't set an option that doesn't apply to the current mode. In particular **Protocol (TCP/UDP) is a client
 choice** — an iperf3 server accepts both and auto-detects from the client, so the
 protocol selector lives under CLIENT OPTIONS and `-u` is never sent to a server
 (sending it produced iperf3's "option is client only" error).
@@ -206,8 +206,27 @@ What it exposes:
 * For **UDP** the stats row and log also show **jitter and packet loss** (measured
   on the receiving side); for **TCP** they show **retransmits**. The end-of-test
   summary logs every direction (sent/received, and the reverse pair for bidir).
-* Note: iperf3 is a throughput tool and does **not** measure round-trip latency,
-  so the GUI can't show it. Use `ping`/`pathping` alongside if you need latency.
+* Note: iperf3 is a throughput tool and does **not** measure round-trip latency
+  (its per-stream RTT comes from Linux `TCP_INFO`, which isn't in the Windows
+  build). For latency, use **Heartbeat mode** below.
+
+### Heartbeat / link monitor (latency + uptime, indefinite)
+
+**Heartbeat** mode is a continuous link monitor — the RTT/latency feature iperf3
+itself doesn't provide. Pick the Heartbeat radio, set a **Target** (host/IP), a
+probe **interval** in milliseconds (e.g. `100`), a **timeout**, and a probe type:
+
+* **ICMP** — a normal ping (no admin needed on Windows).
+* **TCP** — a TCP-connect probe to a **port**, for when ICMP is blocked; it
+  measures connect time.
+
+Click **Run** and it probes forever until you hit **Stop**, plotting **round-trip
+time in milliseconds** on a scrolling graph. The stats row shows current /
+average / peak RTT plus **min/max and packet loss %**, and the status bar shows
+**LINK UP** or **LINK DOWN** with the consecutive-miss count. Probing runs on a
+background thread, so even when the target is unreachable and every probe times
+out, the window stays responsive. It's handy left running in a corner to catch
+intermittent drops, latency spikes, or Wi-Fi flakiness over hours.
 
 ### QoS / DSCP marking on Windows (important caveat)
 

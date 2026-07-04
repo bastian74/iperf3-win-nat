@@ -96,6 +96,8 @@ $script:IperfPath = Find-Iperf
           <Label Content="Mode:"/>
           <RadioButton x:Name="rbClient" Content="Client" IsChecked="True" GroupName="role"/>
           <RadioButton x:Name="rbServer" Content="Server" GroupName="role"/>
+          <RadioButton x:Name="rbHeartbeat" Content="Heartbeat" GroupName="role"
+                       ToolTip="Continuous ping/link monitor with live round-trip-time graph"/>
           <Label Content="Port:" Margin="16,0,0,0"/>
           <TextBox x:Name="txtPort" Width="70" Text="5201"/>
           <Label Content="Interval (-i):" Margin="16,0,0,0"/>
@@ -138,6 +140,26 @@ $script:IperfPath = Find-Iperf
             <TextBlock Text="SERVER OPTIONS" Foreground="#c6a86f" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
             <StackPanel Orientation="Horizontal">
               <CheckBox x:Name="chkUpnp" Content="Auto-forward (UPnP)" ToolTip="Ask the router to forward this port via UPnP so a server behind NAT is reachable"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Heartbeat-only options (disabled unless Heartbeat mode) -->
+        <Border x:Name="grpHeartbeat" BorderBrush="#2a5a4a" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,0,0,2">
+          <StackPanel>
+            <TextBlock Text="HEARTBEAT / LINK MONITOR" Foreground="#6fc6a8" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
+            <StackPanel Orientation="Horizontal">
+              <Label Content="Target:"/>
+              <TextBox x:Name="txtHbHost" Width="150" Text="8.8.8.8" ToolTip="Host or IP to probe"/>
+              <Label Content="Every (ms):" Margin="12,0,0,0"/>
+              <TextBox x:Name="txtHbInterval" Width="55" Text="1000" ToolTip="Heartbeat interval in ms, e.g. 100"/>
+              <Label Content="Timeout (ms):" Margin="10,0,0,0"/>
+              <TextBox x:Name="txtHbTimeout" Width="55" Text="1000"/>
+              <Label Content="Probe:" Margin="12,0,0,0"/>
+              <RadioButton x:Name="rbHbIcmp" Content="ICMP" IsChecked="True" GroupName="hbmethod"/>
+              <RadioButton x:Name="rbHbTcp" Content="TCP" GroupName="hbmethod" ToolTip="TCP-connect probe (use when ICMP is blocked)"/>
+              <Label Content="port" Margin="4,0,2,0"/>
+              <TextBox x:Name="txtHbPort" Width="55" Text="443"/>
             </StackPanel>
           </StackPanel>
         </Border>
@@ -240,6 +262,17 @@ $script:upnpExternalIp = $null    # WAN IP reported by the IGD, if any
 $script:qosProc        = $null    # elevated New/Remove-NetQosPolicy process
 $script:qosFile        = $null    # temp file the elevated process writes its result to
 $script:qosTimer       = $null
+$script:graphUnit      = 'mbps'   # 'mbps' for throughput tests, 'ms' for heartbeat RTT
+# Heartbeat / link-monitor state
+$script:hbActive  = $false
+$script:hbControl = $null         # synchronized @{Stop} shared with the worker runspace
+$script:hbQueue   = $null         # synchronized queue of ping results
+$script:hbPS      = $null
+$script:hbRS      = $null
+$script:hbHandle  = $null
+$script:hbTimer   = $null         # UI-thread drain timer
+$script:hbSent = 0; $script:hbRecv = 0; $script:hbLost = 0
+$script:hbConsec = 0; $script:hbMin = $null; $script:hbMax = 0.0
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -252,6 +285,12 @@ function Add-Log([string]$text, [string]$color = '#c0c0d0') {
 function Format-Rate([double]$mbps) {
     if ($mbps -ge 1000) { return ('{0:N2} Gbit/s' -f ($mbps / 1000)) }
     return ('{0:N1} Mbit/s' -f $mbps)
+}
+
+# Format a Y-axis / stat value according to the current graph unit.
+function Format-Y([double]$v) {
+    if ($script:graphUnit -eq 'ms') { return ('{0:N1} ms' -f $v) }
+    return (Format-Rate $v)
 }
 
 # --- UPnP IGD (router port-forwarding) via the built-in Windows COM API --------
@@ -437,14 +476,16 @@ function Invoke-QosPolicy([string]$mode) {   # 'apply' or 'clear'
 
 function Reset-Graph {
     $script:series = [ordered]@{}
+    $script:graphUnit = 'mbps'
     $script:graph.Children.Clear()
     $script:spStats.Children.Clear()
 }
 
 function Get-DirColor([string]$label) {
     switch ($label) {
-        'TX' { return [Windows.Media.Color]::FromRgb(79,195,247) }   # cyan  - this host sending
-        'RX' { return [Windows.Media.Color]::FromRgb(255,183,77) }   # amber - this host receiving
+        'TX'  { return [Windows.Media.Color]::FromRgb(79,195,247) }   # cyan  - this host sending
+        'RX'  { return [Windows.Media.Color]::FromRgb(255,183,77) }   # amber - this host receiving
+        'RTT' { return [Windows.Media.Color]::FromRgb(129,199,132) }  # green - heartbeat latency
         default { return [Windows.Media.Color]::FromRgb(129,199,132) }
     }
 }
@@ -464,6 +505,10 @@ function Get-Series([string]$label) {
 function Add-Sample([string]$label, [double]$t, [double]$mbps, [string]$extra = '') {
     $ser = Get-Series $label
     $ser.Points.Add([pscustomobject]@{ T = $t; V = $mbps })
+    # Keep a rolling window so an indefinite heartbeat run doesn't grow without
+    # bound; throughput tests have few points so this never triggers for them.
+    $cap = 1500
+    if ($ser.Points.Count -gt $cap) { $ser.Points.RemoveRange(0, $ser.Points.Count - $cap) }
     if ($mbps -gt $ser.Peak) { $ser.Peak = $mbps }
     $ser.Sum += $mbps; $ser.Count += 1; $ser.Last = $mbps; $ser.Extra = $extra
     Redraw-Graph
@@ -488,7 +533,7 @@ function Update-Stats {
         $val.Foreground = $grey
         $extra = if ($ser.Extra) { "     $($ser.Extra)" } else { '' }
         $val.Text = ("Current {0}     Average {1}     Peak {2}{3}" -f `
-                     (Format-Rate $ser.Last), (Format-Rate $avg), (Format-Rate $ser.Peak), $extra)
+                     (Format-Y $ser.Last), (Format-Y $avg), (Format-Y $ser.Peak), $extra)
         [void]$row.Children.Add($val)
         [void]$sp.Children.Add($row)
     }
@@ -506,15 +551,20 @@ function Redraw-Graph {
     if ($plotW -le 0 -or $plotH -le 0) { return }
 
     # global vertical/horizontal scale across all series
-    $maxV = 1.0; $maxT = 1.0
+    $maxV = 1.0; $maxT = 1.0; $minT = [double]::MaxValue
     foreach ($k in $script:series.Keys) {
         $ser = $script:series[$k]
         if ($ser.Peak -gt $maxV) { $maxV = $ser.Peak }
         if ($ser.Points.Count -gt 0) {
+            $ft = $ser.Points[0].T
+            if ($ft -lt $minT) { $minT = $ft }
             $lt = $ser.Points[$ser.Points.Count - 1].T
             if ($lt -gt $maxT) { $maxT = $lt }
         }
     }
+    if ($minT -eq [double]::MaxValue) { $minT = 0.0 }
+    $spanT = $maxT - $minT
+    if ($spanT -le 0) { $spanT = 1.0 }
     # round the axis max up to something readable
     $mag = [Math]::Pow(10, [Math]::Floor([Math]::Log10($maxV)))
     $niceMax = [Math]::Ceiling($maxV / $mag) * $mag
@@ -531,15 +581,15 @@ function Redraw-Graph {
         $ln.Stroke = $gridBrush; $ln.StrokeThickness = 1
         [void]$c.Children.Add($ln)
         $tb = New-Object Windows.Controls.TextBlock
-        $tb.Text = (Format-Rate ($niceMax * $frac))
+        $tb.Text = (Format-Y ($niceMax * $frac))
         $tb.Foreground = $txtBrush; $tb.FontSize = 10
         [Windows.Controls.Canvas]::SetLeft($tb, 2)
         [Windows.Controls.Canvas]::SetTop($tb, $y - 8)
         [void]$c.Children.Add($tb)
     }
-    # X labels (0 and max time)
-    foreach ($tv in @(0.0, $maxT)) {
-        $x = $left + ($tv / $maxT) * $plotW
+    # X labels (window start and end, in elapsed seconds)
+    foreach ($tv in @($minT, $maxT)) {
+        $x = $left + (($tv - $minT) / $spanT) * $plotW
         $tb = New-Object Windows.Controls.TextBlock
         $tb.Text = ('{0:N0}s' -f $tv)
         $tb.Foreground = $txtBrush; $tb.FontSize = 10
@@ -558,7 +608,7 @@ function Redraw-Graph {
         $pl.Stroke = $brush; $pl.StrokeThickness = 2
         $pts = New-Object Windows.Media.PointCollection
         foreach ($p in $ser.Points) {
-            $x = $left + ($p.T / $maxT) * $plotW
+            $x = $left + (($p.T - $minT) / $spanT) * $plotW
             $y = $top + $plotH - ($p.V / $niceMax) * $plotH
             $pts.Add((New-Object Windows.Point $x, $y))
         }
@@ -578,6 +628,142 @@ function Redraw-Graph {
         [void]$c.Children.Add($lt)
         $legendRow += 1
     }
+}
+
+# --- Heartbeat / link monitor --------------------------------------------------
+# Sends an ICMP (or TCP-connect) probe on a fixed interval, indefinitely, and
+# plots round-trip time in ms with live up/down and loss stats. The probing runs
+# in a background runspace so slow/timed-out probes never freeze the UI; the UI
+# just drains a shared queue on a DispatcherTimer.
+
+function Start-Heartbeat {
+    $target = $txtHbHost.Text.Trim()
+    if (-not $target) {
+        [System.Windows.MessageBox]::Show("Enter a target host or IP for the heartbeat.",
+            "iperf3-nat GUI", 'OK', 'Warning') | Out-Null
+        return
+    }
+    $interval = 1000; [void][int]::TryParse($txtHbInterval.Text.Trim(), [ref]$interval)
+    if ($interval -lt 20) { $interval = 20 }
+    $timeout = 1000; [void][int]::TryParse($txtHbTimeout.Text.Trim(), [ref]$timeout)
+    if ($timeout -lt 50) { $timeout = 50 }
+    $method = if ($rbHbTcp.IsChecked) { 'tcp' } else { 'icmp' }
+    $port = 443; [void][int]::TryParse($txtHbPort.Text.Trim(), [ref]$port)
+
+    $txtLog.Clear()
+    Reset-Graph
+    $script:graphUnit = 'ms'
+    $script:hbSent = 0; $script:hbRecv = 0; $script:hbLost = 0
+    $script:hbConsec = 0; $script:hbMin = $null; $script:hbMax = 0.0
+
+    Add-Log ("Heartbeat: probing {0} every {1} ms via {2}{3} (timeout {4} ms). Runs until Stop." -f `
+             $target, $interval, $method, $(if ($method -eq 'tcp') { ":$port" } else { '' }), $timeout)
+    $lblCmd.Text = ("heartbeat {0} {1} every {2} ms" -f $method, $target, $interval)
+
+    $script:hbControl = [hashtable]::Synchronized(@{ Stop = $false })
+    $script:hbQueue   = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+
+    $worker = {
+        param($queue, $control, $target, $intervalMs, $timeoutMs, $method, $port)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        while (-not $control.Stop) {
+            $t = $sw.Elapsed.TotalSeconds
+            $ok = $false; $rtt = 0.0
+            try {
+                if ($method -eq 'tcp') {
+                    $cli = New-Object System.Net.Sockets.TcpClient
+                    $s2 = [System.Diagnostics.Stopwatch]::StartNew()
+                    $iar = $cli.BeginConnect($target, $port, $null, $null)
+                    if ($iar.AsyncWaitHandle.WaitOne($timeoutMs)) {
+                        try { $cli.EndConnect($iar); $ok = $true; $rtt = $s2.Elapsed.TotalMilliseconds } catch { }
+                    }
+                    $cli.Close()
+                } else {
+                    $r = $ping.Send($target, $timeoutMs)
+                    if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $ok = $true; $rtt = [double]$r.RoundtripTime
+                    }
+                }
+            } catch { }
+            $queue.Enqueue([pscustomobject]@{ T = $t; Ok = $ok; Rtt = $rtt })
+            # sleep the interval but wake often so Stop is responsive
+            $slept = 0
+            while (-not $control.Stop -and $slept -lt $intervalMs) {
+                $step = [Math]::Min(50, $intervalMs - $slept)
+                Start-Sleep -Milliseconds $step
+                $slept += $step
+            }
+        }
+    }
+
+    $script:hbRS = [runspacefactory]::CreateRunspace()
+    try { $script:hbRS.ApartmentState = 'MTA' } catch { }
+    $script:hbRS.Open()
+    $script:hbPS = [powershell]::Create()
+    $script:hbPS.Runspace = $script:hbRS
+    [void]$script:hbPS.AddScript($worker).AddArgument($script:hbQueue).AddArgument($script:hbControl).
+        AddArgument($target).AddArgument($interval).AddArgument($timeout).AddArgument($method).AddArgument($port)
+    $script:hbHandle = $script:hbPS.BeginInvoke()
+
+    $script:hbActive = $true
+    Set-Running $true
+    $script:hbTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:hbTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(50, [Math]::Min(200, $interval)))
+    $script:hbTimer.Add_Tick({ Drain-Heartbeat })
+    $script:hbTimer.Start()
+    $lblStatus.Text = 'Heartbeat running...'
+}
+
+function Drain-Heartbeat {
+    if (-not $script:hbQueue) { return }
+    while ($script:hbQueue.Count -gt 0) {
+        $item = $script:hbQueue.Dequeue()
+        $script:hbSent += 1
+        if ($item.Ok) {
+            $script:hbRecv += 1
+            $script:hbConsec = 0
+            $rtt = [double]$item.Rtt
+            if ($null -eq $script:hbMin -or $rtt -lt $script:hbMin) { $script:hbMin = $rtt }
+            if ($rtt -gt $script:hbMax) { $script:hbMax = $rtt }
+            $loss = if ($script:hbSent -gt 0) { 100.0 * $script:hbLost / $script:hbSent } else { 0 }
+            $extra = ('min {0:N1} / max {1:N1} ms   loss {2:N1}% ({3}/{4})' -f `
+                      $script:hbMin, $script:hbMax, $loss, $script:hbRecv, $script:hbSent)
+            Add-Sample 'RTT' ([double]$item.T) $rtt $extra
+        } else {
+            $script:hbLost += 1
+            $script:hbConsec += 1
+        }
+    }
+    $loss = if ($script:hbSent -gt 0) { 100.0 * $script:hbLost / $script:hbSent } else { 0 }
+    if ($script:hbConsec -gt 0) {
+        $script:lblStatus.Text = ("LINK DOWN - {0} consecutive miss(es), loss {1:N1}% ({2} probes)" -f `
+                                  $script:hbConsec, $loss, $script:hbSent)
+    } else {
+        $script:lblStatus.Text = ("LINK UP - loss {0:N1}% over {1} probes" -f $loss, $script:hbSent)
+    }
+}
+
+function Stop-Heartbeat {
+    if ($script:hbControl) { $script:hbControl.Stop = $true }
+    if ($script:hbTimer) { $script:hbTimer.Stop() }
+    Start-Sleep -Milliseconds 80
+    Drain-Heartbeat   # flush the last results
+    if ($script:hbPS) {
+        try { if ($script:hbHandle) { $script:hbPS.EndInvoke($script:hbHandle) } } catch { }
+        try { $script:hbPS.Dispose() } catch { }
+    }
+    if ($script:hbRS) { try { $script:hbRS.Close(); $script:hbRS.Dispose() } catch { } }
+    $script:hbPS = $null; $script:hbRS = $null; $script:hbHandle = $null
+    $script:hbControl = $null; $script:hbQueue = $null; $script:hbTimer = $null
+    $script:hbActive = $false
+    if ($script:hbSent -gt 0) {
+        $loss = 100.0 * $script:hbLost / $script:hbSent
+        Add-Log ("Heartbeat stopped: {0} probes, {1} replies, loss {2:N1}%{3}" -f `
+                 $script:hbSent, $script:hbRecv, $loss,
+                 $(if ($script:hbMin -ne $null) { (', RTT min/max {0:N1}/{1:N1} ms' -f $script:hbMin, $script:hbMax) } else { '' }))
+    }
+    $script:graphUnit = 'mbps'
 }
 
 # Direction label for a "sum" object: TX = this host is sending, RX = receiving.
@@ -693,8 +879,8 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     # Group containers (grpClient/grpServer) disable all their children via WPF
     # IsEnabled propagation, so we only toggle the containers + the common controls.
-    foreach ($ctl in @($rbClient,$rbServer,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
-                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$txtIperf,$btnBrowse,$btnPubIp)) {
+    foreach ($ctl in @($rbClient,$rbServer,$rbHeartbeat,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
+                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$grpHeartbeat,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
     if (-not $on) { & $script:updateRole }   # re-apply which role's group is active
@@ -738,6 +924,8 @@ function Build-Args {
 
 function Start-Run {
     if ($script:running) { return }
+    # Heartbeat mode is self-contained (no iperf3 process) - hand off and return.
+    if ($rbHeartbeat.IsChecked) { Start-Heartbeat; return }
     $exe = $txtIperf.Text.Trim()
     if (-not $exe -or -not (Test-Path $exe)) {
         [System.Windows.MessageBox]::Show("Could not find iperf3.exe. Use Browse to select it.",
@@ -821,6 +1009,13 @@ function Start-Run {
 }
 
 function Stop-Run([string]$reason = 'Stopped.') {
+    # Heartbeat mode has no iperf3 process; tear down the monitor instead.
+    if ($script:hbActive) {
+        Stop-Heartbeat
+        Set-Running $false
+        $lblStatus.Text = $reason
+        return
+    }
     if ($script:proc -and -not $script:proc.HasExited) {
         try { $script:proc.Kill() } catch { }
     }
@@ -887,11 +1082,17 @@ $graph.Add_SizeChanged({ Redraw-Graph })
 # Enable/disable client-only fields when role changes
 $script:updateRole = {
     $isClient = $rbClient.IsChecked
-    $grpClient.IsEnabled = $isClient        # CLIENT OPTIONS group
-    $grpServer.IsEnabled = -not $isClient   # SERVER OPTIONS group
+    $isServer = $rbServer.IsChecked
+    $isHb     = $rbHeartbeat.IsChecked
+    $grpClient.IsEnabled    = $isClient          # CLIENT OPTIONS
+    $grpServer.IsEnabled    = $isServer          # SERVER OPTIONS
+    $grpHeartbeat.IsEnabled = $isHb              # HEARTBEAT
+    # Port/Interval/NAT are iperf3 settings - not used by the heartbeat monitor.
+    foreach ($c in @($txtPort, $txtInterval, $chkNat)) { $c.IsEnabled = ($isClient -or $isServer) }
 }
 $rbClient.Add_Checked($script:updateRole)
 $rbServer.Add_Checked($script:updateRole)
+$rbHeartbeat.Add_Checked($script:updateRole)
 & $script:updateRole   # apply once at startup (default is client mode)
 
 $win.Add_Closing({
