@@ -45,7 +45,7 @@ $script:IperfPath = Find-Iperf
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="iperf3-nat GUI" Height="720" Width="960"
+        Title="iperf3-nat GUI" Height="820" Width="980"
         WindowStartupLocation="CenterScreen" Background="#1e1e2a">
   <Window.Resources>
     <Style TargetType="Label">
@@ -82,7 +82,7 @@ $script:IperfPath = Find-Iperf
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
-      <RowDefinition Height="150"/>
+      <RowDefinition Height="240" MinHeight="120"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
@@ -161,10 +161,10 @@ $script:IperfPath = Find-Iperf
       </Grid.ColumnDefinitions>
       <Label Grid.Column="0" Content="iperf3.exe:"/>
       <TextBox Grid.Column="1" x:Name="txtIperf" Margin="0,0,6,0"/>
-      <Button Grid.Column="2" x:Name="btnBrowse" Content="Browse…" Width="80" Height="26" Margin="0,0,10,0"/>
-      <Button Grid.Column="3" x:Name="btnRun" Content="► Run" Width="90" Height="26" Margin="0,0,6,0"
+      <Button Grid.Column="2" x:Name="btnBrowse" Content="Browse..." Width="80" Height="26" Margin="0,0,10,0"/>
+      <Button Grid.Column="3" x:Name="btnRun" Content="Run" Width="90" Height="26" Margin="0,0,6,0"
               Background="#2e7d32" Foreground="White" FontWeight="Bold"/>
-      <Button Grid.Column="4" x:Name="btnStop" Content="■ Stop" Width="90" Height="26"
+      <Button Grid.Column="4" x:Name="btnStop" Content="Stop" Width="90" Height="26"
               Background="#7d2e2e" Foreground="White" FontWeight="Bold" IsEnabled="False"/>
     </Grid>
 
@@ -178,11 +178,11 @@ $script:IperfPath = Find-Iperf
             CornerRadius="4" Padding="8,4" Margin="0,6,0,6">
       <StackPanel Orientation="Horizontal">
         <TextBlock Foreground="#8080a0" Text="Current: "/>
-        <TextBlock x:Name="lblCur" Foreground="#4fc3f7" FontWeight="Bold" Text="—" Width="130"/>
+        <TextBlock x:Name="lblCur" Foreground="#4fc3f7" FontWeight="Bold" Text="-" Width="130"/>
         <TextBlock Foreground="#8080a0" Text="Average: "/>
-        <TextBlock x:Name="lblAvg" Foreground="#81c784" FontWeight="Bold" Text="—" Width="130"/>
+        <TextBlock x:Name="lblAvg" Foreground="#81c784" FontWeight="Bold" Text="-" Width="130"/>
         <TextBlock Foreground="#8080a0" Text="Peak: "/>
-        <TextBlock x:Name="lblPeak" Foreground="#ffb74d" FontWeight="Bold" Text="—" Width="130"/>
+        <TextBlock x:Name="lblPeak" Foreground="#ffb74d" FontWeight="Bold" Text="-" Width="130"/>
         <TextBlock x:Name="lblExtra" Foreground="#b0b0c8" Text=""/>
       </StackPanel>
     </Border>
@@ -190,7 +190,7 @@ $script:IperfPath = Find-Iperf
     <!-- Row 4: log -->
     <TextBox Grid.Row="4" x:Name="txtLog" Margin="0,0,0,6" IsReadOnly="True"
              VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-             FontFamily="Consolas" FontSize="11" Background="#15151f" Foreground="#c0c0d0"
+             FontFamily="Consolas" FontSize="13" Background="#15151f" Foreground="#c0c0d0"
              TextWrapping="NoWrap"/>
 
     <!-- Row 5: status bar -->
@@ -318,9 +318,9 @@ function Reset-Graph {
     $script:peak = 0.0
     $script:sumV = 0.0
     $script:graph.Children.Clear()
-    $script:lblCur.Text  = '—'
-    $script:lblAvg.Text  = '—'
-    $script:lblPeak.Text = '—'
+    $script:lblCur.Text  = '-'
+    $script:lblAvg.Text  = '-'
+    $script:lblPeak.Text = '-'
     $script:lblExtra.Text = ''
 }
 
@@ -595,7 +595,7 @@ function Start-Run {
             $protos = @('TCP')
             if ($rbUdp.IsChecked) { $protos += 'UDP' }   # UDP tests also need the UDP port
             Add-Log ("UPnP: requesting router forward of port {0}/{1} -> {2} ..." -f $port, ($protos -join '+'), $localIP)
-            $lblStatus.Text = 'Requesting UPnP port mapping from router…'
+            $lblStatus.Text = 'Requesting UPnP port mapping from router...'
             $u = Add-UpnpMapping -Port $port -Protocols $protos -LocalIP $localIP -Desc 'iperf3-nat'
             if ($u.Ok) {
                 $script:upnpMappings   = $u.Mapped
@@ -614,7 +614,7 @@ function Start-Run {
         }
     }
 
-    $lblStatus.Text = if ($rbServer.IsChecked) { 'Server running - waiting for clients…' } else { 'Test running…' }
+    $lblStatus.Text = if ($rbServer.IsChecked) { 'Server running - waiting for clients...' } else { 'Test running...' }
     $script:timer.Start()
 }
 
