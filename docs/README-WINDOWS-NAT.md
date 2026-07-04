@@ -183,7 +183,9 @@ What it exposes:
 * **Mode** — Client or Server
 * **Host**, **Port**, **Protocol** (TCP/UDP)
 * **Duration** (`-t`), **Streams** (`-P`), **Interval** (`-i`), **Bitrate**
-  (`-b`), **Length/packet size** (`-l`), **Window** (`-w`), **DSCP** (`--dscp`)
+  (`-b`), **Length/packet size** (`-l`), **Window** (`-w`)
+* **Windows QoS - DSCP** with **Apply/Clear policy** buttons (real marking via
+  `New-NetQosPolicy`; see the QoS section)
 * **Reverse** (`-R`), **Bidirectional** (`--bidir`), **NAT mode** (`--nat`)
 * **Auto-forward (UPnP)** — server-mode only; see below
 * A **Public IP** button — look up this machine's internet-visible address
@@ -209,22 +211,62 @@ What it exposes:
 
 ### QoS / DSCP marking on Windows (important caveat)
 
-The **DSCP** box passes `--dscp` (accepts names like `EF`, `CS5`, `AF11` or a
-number 0-63) so iperf3 asks the socket to mark packets. **However, Windows
-usually strips application-set DSCP/ToS values by default** — the socket call
-succeeds but the bits never reach the wire. This is a Windows policy, not an
-iperf3 limitation. To actually mark packets on Windows you generally need one of:
+The **Windows QoS - DSCP** field accepts names like `EF`, `CS5`, `AF11` or a
+number 0-63. It is passed as `--dscp` for client tests, **but Windows strips
+application-set DSCP/ToS by default** — the socket call succeeds and the bits
+never reach the wire. This is a Windows policy, not an iperf3 limitation. Real
+marking requires a **Policy-based QoS** rule applied by the Windows QoS Packet
+Scheduler.
 
-* a **Group Policy QoS Policy** (Computer/User Config → Policy-based QoS) that
-  matches the app or port and sets the DSCP value — the recommended, supported
-  way; or
-* the legacy registry override
-  `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\DisableUserTOSSetting = 0`
-  (a reboot is required, and it is disabled by default for a reason).
+The GUI does this for you: the **Apply policy** button (next to the DSCP field)
+relaunches elevated (UAC) and runs `New-NetQosPolicy` to mark `iperf3.exe`
+outbound traffic with your DSCP value; **Clear** removes it. Equivalent manual
+command in an elevated PowerShell:
 
-So treat the DSCP box as "request marking"; verify with a capture (Wireshark) or
-switch statistics whether the bits actually survive on your network. On Linux/BSD
-peers the same `--dscp` works without these hoops.
+```powershell
+New-NetQosPolicy -Name "iperf3-EF" -AppPathNameMatchCondition "iperf3.exe" `
+    -IPProtocolMatchCondition Both -DSCPAction 46 -NetworkProfile All
+# undo: Remove-NetQosPolicy -Name "iperf3-EF" -Confirm:$false
+```
+
+Things that trip people up:
+
+* **`-NetworkProfile All` is essential** — the #1 reason a local QoS policy does
+  nothing is that it defaults to the Domain profile only, while a home/standalone
+  machine is Private/Public. The GUI always uses `All`.
+* **Mark on the sender.** DSCP is set on *outbound* packets — the **client** for a
+  normal upload test, the **server** for a reverse (`-R`) download test. (The GUI
+  applies to `iperf3.exe` outbound, so run Apply on whichever machine sends.)
+* **The QoS Packet Scheduler must be bound to the NIC** (adapter properties →
+  "QoS Packet Scheduler"; on by default).
+* **Verify on the RECEIVER**, not the sender. A sender-side capture is ambiguous
+  about whether the mark was applied before or after the capture hook. In
+  Wireshark filter `ip.dsfield.dscp == 46` and read IP header → Differentiated
+  Services (EF = DS `0xb8`). Don't test over loopback.
+* The legacy `DisableUserTOSSetting=0` registry trick is the XP-era method and is
+  unreliable on Windows 10/11 — use the QoS policy instead.
+
+On Linux/BSD peers the plain `--dscp` works without any of this.
+
+### Reading Wireshark on Windows: giant "packets" and floods of tiny ACKs
+
+If you capture on the **sending** host you will often see occasional huge frames
+(e.g. 64 KB) leaving your machine and the peer replying with a stream of 60-byte
+ACKs — dozens of ACKs per giant frame. **This is a capture artifact, not what is
+on the wire.** Windows hands the NIC one large buffer and the NIC's **TCP
+Segmentation Offload (LSO/TSO)** chops it into MTU-sized (~1500-byte) segments
+*after* Wireshark's capture point, so Wireshark shows the pre-segmentation
+super-frame. The receiver sees the real ~1460-byte segments and (with delayed
+ACK) acknowledges roughly every other one, which is why you see many small ACKs
+between each giant sender "packet." The 60-byte ACK size is just the minimum
+Ethernet frame (a bare 40-byte ACK padded to 60). In a default one-way test the
+server only receives, so it only sends ACKs — no data.
+
+None of this hurts throughput (offload is a performance feature). To see true
+wire-sized packets, either **capture on the receiver** (or a switch mirror/tap),
+or disable **Large Send Offload v2 (IPv4/IPv6)** in the sending adapter's
+Advanced properties (expect slightly lower CPU efficiency). This is also why DSCP
+should be verified on the receiver.
 
 ### Public IP button
 

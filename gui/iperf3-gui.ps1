@@ -126,8 +126,6 @@ $script:IperfPath = Find-Iperf
               <TextBox x:Name="txtLen" Width="58" Text="" ToolTip="Packet/buffer size: UDP datagram or TCP read/write size, e.g. 1400 or 128K"/>
               <Label Content="Window (-w):" Margin="10,0,0,0"/>
               <TextBox x:Name="txtWindow" Width="58" Text=""/>
-              <Label Content="DSCP:" Margin="10,0,0,0"/>
-              <TextBox x:Name="txtDscp" Width="52" Text="" ToolTip="QoS marking, e.g. EF, CS5, AF11 or 0-63. Note: Windows often ignores socket DSCP (see docs)."/>
               <CheckBox x:Name="chkReverse" Content="Reverse (-R)" Margin="12,0,0,0"/>
               <CheckBox x:Name="chkBidir" Content="Bidir (--bidir)"/>
             </StackPanel>
@@ -148,6 +146,17 @@ $script:IperfPath = Find-Iperf
         <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
           <Label Content="Extra args:"/>
           <TextBox x:Name="txtExtra" Width="420" Text="" ToolTip="Any additional iperf3 flags, passed through verbatim"/>
+        </StackPanel>
+
+        <!-- Common: Windows QoS / DSCP marking (applies to whichever side sends) -->
+        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+          <Label Content="Windows QoS - DSCP:"/>
+          <TextBox x:Name="txtDscp" Width="60" Text="" ToolTip="DSCP value: EF, CS5, AF11 or 0-63. Passed as --dscp for clients, and used by Apply to create a Windows QoS policy."/>
+          <Button x:Name="btnQosApply" Content="Apply policy" Width="90" Height="24" Margin="8,0,0,0"
+                  ToolTip="Create a Windows Policy-based QoS rule (needs admin) so iperf3.exe packets are actually DSCP-marked on the wire"/>
+          <Button x:Name="btnQosClear" Content="Clear" Width="56" Height="24" Margin="6,0,0,0"
+                  ToolTip="Remove the Windows QoS policy created by Apply"/>
+          <Label Content="marks iperf3.exe outbound (admin); Windows ignores app-set DSCP without this" Foreground="#8080a0" Margin="8,0,0,0"/>
         </StackPanel>
 
       </StackPanel>
@@ -228,6 +237,9 @@ $script:timer     = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(200)
 $script:upnpMappings   = @()      # list of @{Port=;Protocol=} we created on the router
 $script:upnpExternalIp = $null    # WAN IP reported by the IGD, if any
+$script:qosProc        = $null    # elevated New/Remove-NetQosPolicy process
+$script:qosFile        = $null    # temp file the elevated process writes its result to
+$script:qosTimer       = $null
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -347,6 +359,80 @@ function Resolve-AndShowPublicIP {
     }
     Add-Log "Could not resolve public IP (no outbound internet, or the lookup services are blocked)."
     return $null
+}
+
+# --- Windows Policy-based QoS (real DSCP marking) ------------------------------
+# Windows ignores DSCP that an app sets on its socket, so --dscp alone does not
+# mark packets on the wire. A Policy-based QoS rule (applied by the QoS Packet
+# Scheduler) does. Creating/removing one needs admin, so we relaunch elevated.
+
+function Convert-Dscp([string]$v) {
+    if (-not $v) { return $null }
+    $v = $v.Trim().ToUpper()
+    $map = @{ 'BE'=0;'CS0'=0;'CS1'=8;'CS2'=16;'CS3'=24;'CS4'=32;'CS5'=40;'CS6'=48;'CS7'=56;
+              'AF11'=10;'AF12'=12;'AF13'=14;'AF21'=18;'AF22'=20;'AF23'=22;'AF31'=26;'AF32'=28;'AF33'=30;
+              'AF41'=34;'AF42'=36;'AF43'=38;'EF'=46 }
+    if ($map.ContainsKey($v)) { return $map[$v] }
+    $n = 0
+    if ([int]::TryParse($v, [ref]$n) -and $n -ge 0 -and $n -le 63) { return $n }
+    return $null
+}
+
+function Invoke-QosPolicy([string]$mode) {   # 'apply' or 'clear'
+    $name = 'iperf3-nat-gui'
+    $resultFile = [IO.Path]::Combine([IO.Path]::GetTempPath(), ("iperf3qos_{0}.txt" -f ([guid]::NewGuid().ToString('N'))))
+
+    if ($mode -eq 'apply') {
+        $dscp = Convert-Dscp $txtDscp.Text.Trim()
+        if ($null -eq $dscp) {
+            [System.Windows.MessageBox]::Show("Enter a DSCP value first (0-63, or a name like EF, CS5, AF11).",
+                "iperf3-nat GUI", 'OK', 'Warning') | Out-Null
+            return
+        }
+        $exeName = [IO.Path]::GetFileName($txtIperf.Text.Trim())
+        if (-not $exeName) { $exeName = 'iperf3.exe' }
+        $inner = "try { Remove-NetQosPolicy -Name '$name' -Confirm:`$false -ErrorAction SilentlyContinue; " +
+                 "New-NetQosPolicy -Name '$name' -AppPathNameMatchCondition '$exeName' " +
+                 "-IPProtocolMatchCondition Both -DSCPAction $dscp -NetworkProfile All -ErrorAction Stop | Out-Null; " +
+                 "'OK: applied DSCP $dscp to $exeName outbound (all network profiles).' } " +
+                 "catch { 'ERROR: ' + `$_.Exception.Message } | Set-Content -Path '$resultFile'"
+        Add-Log ("QoS: requesting elevation to mark {0} with DSCP {1} ..." -f $exeName, $dscp)
+    }
+    else {
+        $inner = "try { Remove-NetQosPolicy -Name '$name' -Confirm:`$false -ErrorAction Stop; " +
+                 "'OK: removed QoS policy.' } catch { 'ERROR: ' + `$_.Exception.Message } | Set-Content -Path '$resultFile'"
+        Add-Log "QoS: requesting elevation to remove the QoS policy ..."
+    }
+
+    try {
+        $proc = Start-Process powershell -Verb RunAs -PassThru -WindowStyle Hidden `
+                    -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-Command', $inner
+    } catch {
+        Add-Log ("QoS: elevation was cancelled or failed ({0})." -f $_.Exception.Message)
+        return
+    }
+
+    # Poll (on the UI thread) for the elevated process to finish, then report.
+    $script:qosProc  = $proc
+    $script:qosFile  = $resultFile
+    $script:qosTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $script:qosTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+    $script:qosTimer.Add_Tick({
+        if ($script:qosProc -and $script:qosProc.HasExited) {
+            $script:qosTimer.Stop()
+            $msg = ''
+            if (Test-Path $script:qosFile) {
+                $msg = (Get-Content $script:qosFile -Raw).Trim()
+                Remove-Item $script:qosFile -ErrorAction SilentlyContinue
+            }
+            if ($msg) { Add-Log ("QoS: " + $msg) }
+            else      { Add-Log "QoS: elevated command finished (no result captured)." }
+            if ($msg -like 'OK:*') {
+                Add-Log "QoS: verify on the RECEIVER with Wireshark filter  ip.dsfield.dscp == <value>."
+            }
+        }
+    })
+    $script:qosTimer.Start()
 }
 
 function Reset-Graph {
@@ -607,8 +693,8 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     # Group containers (grpClient/grpServer) disable all their children via WPF
     # IsEnabled propagation, so we only toggle the containers + the common controls.
-    foreach ($ctl in @($rbClient,$rbServer,$txtPort,$txtInterval,$chkNat,$txtExtra,
-                       $grpClient,$grpServer,$txtIperf,$btnBrowse,$btnPubIp)) {
+    foreach ($ctl in @($rbClient,$rbServer,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
+                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
     if (-not $on) { & $script:updateRole }   # re-apply which role's group is active
@@ -782,6 +868,9 @@ $btnPubIp.Add_Click({
     }
     $btnPubIp.IsEnabled = $true
 })
+
+$btnQosApply.Add_Click({ Invoke-QosPolicy 'apply' })
+$btnQosClear.Add_Click({ Invoke-QosPolicy 'clear' })
 
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
