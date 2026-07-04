@@ -31,3 +31,8 @@ examples/Makefile
 examples/mic
 examples/mis
 .vscode/
+
+# iperf3-nat: Windows build artifacts and self-contained distribution
+*.exe
+*.dll
+/dist/

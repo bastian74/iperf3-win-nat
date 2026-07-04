@@ -558,9 +558,12 @@ iperf_run_server(struct iperf_test *test)
     int result, s;
     int send_streams_accepted, rec_streams_accepted;
     int streams_to_send = 0, streams_to_rec = 0;
-#if defined(HAVE_TCP_CONGESTION)
+#if defined(HAVE_TCP_CONGESTION) || defined(HAVE_TCP_USER_TIMEOUT)
+    /* saved_errno is used by both the TCP_CONGESTION and TCP_USER_TIMEOUT
+     * error paths below.  On Linux both are always defined together; on
+     * Cygwin/MSYS2 only TCP_USER_TIMEOUT is, so guard on either. */
     int saved_errno;
-#endif /* HAVE_TCP_CONGESTION */
+#endif
     fd_set read_set, write_set;
     struct iperf_stream *sp;
     struct iperf_time now;

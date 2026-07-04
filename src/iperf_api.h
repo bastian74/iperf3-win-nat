@@ -107,6 +107,7 @@ typedef atomic_uint_fast64_t atomic_iperf_size_t;
 #define OPT_JSON_STREAM_FULL_OUTPUT 33
 #define OPT_SERVER_MAX_DURATION 34
 #define OPT_GSRO 35
+#define OPT_NAT 36              /* iperf3-nat: NAT/PAT/firewall-friendly mode */
 
 /* states */
 #define TEST_START 1

@@ -1194,6 +1194,7 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
         {"mptcp", no_argument, NULL, 'm'},
 #endif
         {"gsro", no_argument, NULL, OPT_GSRO},
+        {"nat", no_argument, NULL, OPT_NAT},
         {"debug", optional_argument, NULL, 'd'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
@@ -1657,6 +1658,41 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
                 }
                 break;
 #endif /* HAVE_TCP_KEEPALIVE */
+            case OPT_NAT:
+                /*
+                 * iperf3-nat: NAT/PAT/firewall-friendly mode.
+                 *
+                 * iperf3 already routes every connection (control and data,
+                 * in both directions) from the client to the single server
+                 * port, so only one inbound TCP port has to be reachable on
+                 * the server side.  The remaining fragility when running
+                 * across NAT/PAT and stateful firewalls is that the TCP
+                 * control connection goes idle during a test (especially a
+                 * long UDP test) and the NAT/firewall silently drops the
+                 * mapping, killing the test at the end.
+                 *
+                 * --nat turns on control-connection TCP keepalive with
+                 * aggressive-but-safe defaults so the mapping is refreshed
+                 * long before typical NAT/firewall idle timeouts (often
+                 * 30-60s).  Values may still be overridden with --cntl-ka.
+                 */
+                test->nat_mode = 1;
+#if defined (HAVE_TCP_KEEPALIVE)
+                if (!test->settings->cntl_ka) {
+                    test->settings->cntl_ka = 1;
+                    /* KEEPIDLE must be > KEEPINTVL * KEEPCNT (see --cntl-ka). */
+                    if (test->settings->cntl_ka_keepidle == 0)
+                        test->settings->cntl_ka_keepidle = 15;
+                    if (test->settings->cntl_ka_interval == 0)
+                        test->settings->cntl_ka_interval = 4;
+                    if (test->settings->cntl_ka_count == 0)
+                        test->settings->cntl_ka_count = 3;
+                }
+#else
+                warning("--nat: control-connection keepalive not available on this platform; "
+                        "single-port operation still applies");
+#endif /* HAVE_TCP_KEEPALIVE */
+                break;
             case 'A':
 #if defined(HAVE_CPU_AFFINITY)
                 test->affinity = strtol(optarg, &endptr, 0);
@@ -3759,6 +3795,7 @@ iperf_reset_test(struct iperf_test *test)
         test->bitrate_limit_intervals_traffic_bytes[i] = 0;
 
     test->reverse = 0;
+    test->nat_mode = 0;
     test->bidirectional = 0;
     test->no_delay = 0;
 

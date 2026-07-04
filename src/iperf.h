@@ -355,6 +355,7 @@ struct iperf_test
     int       one_off;                          /* -1 option */
     int       no_delay;                         /* -N option */
     int       reverse;                          /* -R option */
+    int       nat_mode;                          /* --nat: NAT/PAT/firewall-friendly defaults (iperf3-nat fork) */
     int       bidirectional;                    /* --bidirectional */
     int	      verbose;                          /* -V option - verbose mode */
     int	      json_output;                      /* -J option - JSON output */

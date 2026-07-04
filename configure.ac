@@ -25,7 +25,7 @@
 
 # Initialize the autoconf system for the specified tool, version and mailing list
 AC_PREREQ([2.71])
-AC_INIT([iperf],[3.21+],[https://github.com/esnet/iperf],[iperf],[https://software.es.net/iperf/])
+AC_INIT([iperf],[3.21+-nat1],[https://github.com/esnet/iperf],[iperf],[https://software.es.net/iperf/])
 m4_include([config/ax_check_openssl.m4])
 m4_include([config/ax_pthread.m4])
 m4_include([config/iperf_config_static_bin.m4])
@@ -193,10 +193,18 @@ else
 fi
 
 # Check for TCP_CONGESTION sockopt (believed to be Linux and FreeBSD only)
+# NOTE (iperf3-nat fork): include <sys/types.h> and <netinet/in.h> before
+# <netinet/tcp.h>.  On Cygwin/MSYS2 <netinet/tcp.h> does not compile standalone
+# (it references u_int32_t etc. without pulling in the defining headers), so the
+# original single-header probes failed to *compile* and silently disabled these
+# features even when the sockopt was actually available.
 AC_CACHE_CHECK([TCP_CONGESTION socket option],
 [iperf3_cv_header_tcp_congestion],
 AC_COMPILE_IFELSE(
-  [AC_LANG_PROGRAM([[#include <netinet/tcp.h>]],
+  [AC_LANG_PROGRAM([[#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>]],
                    [[int foo = TCP_CONGESTION;]])],
   iperf3_cv_header_tcp_congestion=yes,
   iperf3_cv_header_tcp_congestion=no))
@@ -208,7 +216,10 @@ fi
 AC_CACHE_CHECK([TCP_USER_TIMEOUT socket option],
 [iperf3_cv_header_tcp_user_timeout],
 AC_COMPILE_IFELSE(
-  [AC_LANG_PROGRAM([[#include <netinet/tcp.h>]],
+  [AC_LANG_PROGRAM([[#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>]],
                    [[int foo = TCP_USER_TIMEOUT;]])],
   iperf3_cv_header_tcp_user_timeout=yes,
   iperf3_cv_header_tcp_user_timeout=no))
@@ -216,11 +227,17 @@ if test "x$iperf3_cv_header_tcp_user_timeout" = "xyes"; then
     AC_DEFINE([HAVE_TCP_USER_TIMEOUT], [1], [Have TCP_USER_TIMEOUT sockopt.])
 fi
 
-# Check for TCP_KEEPIDLE sockopt (not clear where supported)
+# Check for TCP_KEEPIDLE sockopt (Linux, and also Cygwin/MSYS2 on Windows).
+# This gates the control-connection keepalive (--cntl-ka / --nat), which is what
+# keeps a test's TCP control channel alive across NAT/PAT idle-mapping expiry and
+# stateful-firewall idle timeouts - essential when running through NAT on Windows.
 AC_CACHE_CHECK([TCP_KEEPIDLE socket option],
 [iperf3_cv_header_tcp_keepalive],
 AC_COMPILE_IFELSE(
-  [AC_LANG_PROGRAM([[#include <netinet/tcp.h>]],
+  [AC_LANG_PROGRAM([[#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>]],
                    [[int foo = TCP_KEEPIDLE;]])],
   iperf3_cv_header_tcp_keepalive=yes,
   iperf3_cv_header_tcp_keepalive=no))

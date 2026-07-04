@@ -133,6 +133,9 @@ const char usage_longstr[] = "Usage: iperf3 [-s|-c host] [options]\n"
                            "  --cntl-ka[=#/#/#]         use control connection TCP keepalive - KEEPIDLE/KEEPINTV/KEEPCNT\n"
                            "                            each value is optional with system settings default\n"
 #endif //HAVE_TCP_KEEPALIVE
+                           "  --nat                     NAT/PAT/firewall-friendly mode: keep the control connection\n"
+                           "                            alive across NAT/firewall idle timeouts (enables control TCP\n"
+                           "                            keepalive where supported). Use on the side behind NAT.\n"
 #if defined(HAVE_IPPROTO_MPTCP)
                            "  -m, --mptcp               use MPTCP rather than plain TCP\n"
 #endif
