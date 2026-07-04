@@ -150,6 +150,45 @@ popular Cygwin-based Windows iperf3 builds.
 
 ---
 
+## GUI (jperf-style, with real-time graphing)
+
+The `gui/` folder contains a dependency-free graphical front-end — the spiritual
+successor to jperf, but built for iperf3. It is a WPF app driven by Windows
+PowerShell (already present on every Windows machine; nothing to install) that
+exposes the common command-line options as controls and draws a **live
+throughput graph** by parsing iperf3's `--json-stream` output.
+
+Launch it by double-clicking **`iperf3-gui.cmd`** (it starts PowerShell in the
+STA mode WPF requires), or:
+
+```
+powershell.exe -STA -ExecutionPolicy Bypass -File gui\iperf3-gui.ps1
+```
+
+It auto-locates `iperf3.exe` (same folder, `..\src`, or the `dist` build); use
+**Browse…** to point at a specific binary. `build-windows.sh` copies the GUI into
+`dist/iperf3-nat-windows/` alongside the exe, so the packaged build is a complete,
+self-contained bundle.
+
+What it exposes:
+
+* **Mode** — Client or Server
+* **Host**, **Port**, **Protocol** (TCP/UDP)
+* **Duration** (`-t`), **Streams** (`-P`), **Interval** (`-i`), **Bitrate**
+  (`-b`), **Window** (`-w`)
+* **Reverse** (`-R`), **Bidirectional** (`--bidir`), **NAT mode** (`--nat`)
+* An **Extra args** box for anything else (passed through verbatim)
+
+While a test runs it shows the live per-interval line graph plus current /
+average / peak counters and a scrolling log; UDP tests additionally show jitter
+and loss, and TCP tests show retransmits. **Stop** kills the run. Because it uses
+`--json-stream` rather than scraping human-readable text (the brittle thing jperf
+did with iperf2), the parsing is robust and works with reverse/bidir/UDP modes.
+
+The GUI runs the same `iperf3.exe` documented above, so all the NAT guidance
+applies: put the server on the reachable side, tick **NAT mode**, and tick
+**Reverse** to graph a download test from a client behind NAT.
+
 ## Compatibility
 
 * Wire-protocol compatible with upstream iperf3 3.21+. A `iperf3-nat` client can

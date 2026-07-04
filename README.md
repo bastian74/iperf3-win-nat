@@ -5,7 +5,8 @@ iperf3-nat:  iperf3 for Windows, across NAT / PAT / firewalls
 > It makes iperf3 practical to run on Windows and through NAT/PAT/stateful
 > firewalls, by fixing the Windows build so the control-connection keepalive is
 > compiled in, adding a single `--nat` convenience flag, and documenting the
-> connection patterns that traverse NAT.
+> connection patterns that traverse NAT. It also ships a dependency-free,
+> jperf-style **GUI with real-time throughput graphing** (see `gui/`).
 >
 > **See [`docs/README-WINDOWS-NAT.md`](docs/README-WINDOWS-NAT.md) for the
 > Windows/NAT guide and [`build-windows.sh`](build-windows.sh) to produce a

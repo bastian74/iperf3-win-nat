@@ -42,6 +42,10 @@ mkdir -p "$outdir"
 cp "$exe" "$outdir/"
 cp -f COPYING LICENSE README.md docs/README-WINDOWS-NAT.md "$outdir/" 2>/dev/null || true
 
+# Bundle the GUI front-end (jperf-style, with real-time graphing) next to the exe
+# so it finds iperf3.exe in its own folder.
+cp -f gui/iperf3-gui.ps1 gui/iperf3-gui.cmd "$outdir/" 2>/dev/null || true
+
 # Copy every non-system DLL the exe depends on (msys-2.0.dll, and anything else
 # ldd reports outside of C:\Windows) so the folder is self-contained.
 echo "==> Resolving runtime DLL dependencies"
