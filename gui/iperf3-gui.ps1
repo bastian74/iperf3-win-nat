@@ -580,7 +580,10 @@ function Build-Args {
     if ($txtExtra.Text.Trim()) {
         foreach ($tok in ($txtExtra.Text.Trim() -split '\s+')) { if ($tok) { $a.Add($tok) } }
     }
-    return $a
+    # Return with the unary comma so PowerShell does NOT unroll the List into the
+    # pipeline (which would make the caller receive a fixed-size object[] and fail
+    # on the later .Add() calls).
+    return ,$a
 }
 
 function Start-Run {
