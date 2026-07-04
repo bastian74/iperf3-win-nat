@@ -178,7 +178,19 @@ What it exposes:
   (`-b`), **Window** (`-w`)
 * **Reverse** (`-R`), **Bidirectional** (`--bidir`), **NAT mode** (`--nat`)
 * **Auto-forward (UPnP)** — server-mode only; see below
+* A **Public IP** button — look up this machine's internet-visible address
 * An **Extra args** box for anything else (passed through verbatim)
+
+### Public IP button
+
+Click **Public IP** to resolve this machine's internet-visible address (via a
+public echo service such as api.ipify.org, with several fallbacks) and copy it to
+the clipboard — that's the address remote clients on the internet should connect
+to. It works whether or not UPnP is available, as long as outbound HTTPS is
+allowed. Note this reports the address the outside world sees; if you are behind
+carrier-grade NAT it will be a shared address that still won't accept inbound
+connections. The router's own WAN IP (which may differ) is reported separately by
+the UPnP mapping when you use Auto-forward.
 
 ### Auto-forward (UPnP) — for a server that *is* behind NAT
 

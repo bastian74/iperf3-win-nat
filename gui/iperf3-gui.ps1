@@ -157,14 +157,16 @@ $script:IperfPath = Find-Iperf
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
         <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
-        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
       </Grid.ColumnDefinitions>
       <Label Grid.Column="0" Content="iperf3.exe:"/>
       <TextBox Grid.Column="1" x:Name="txtIperf" Margin="0,0,6,0"/>
-      <Button Grid.Column="2" x:Name="btnBrowse" Content="Browse..." Width="80" Height="26" Margin="0,0,10,0"/>
-      <Button Grid.Column="3" x:Name="btnRun" Content="Run" Width="90" Height="26" Margin="0,0,6,0"
+      <Button Grid.Column="2" x:Name="btnPubIp" Content="Public IP" Width="90" Height="26" Margin="0,0,10,0"
+              ToolTip="Look up this machine's internet-visible public IP and copy it to the clipboard"/>
+      <Button Grid.Column="3" x:Name="btnBrowse" Content="Browse..." Width="80" Height="26" Margin="0,0,10,0"/>
+      <Button Grid.Column="4" x:Name="btnRun" Content="Run" Width="90" Height="26" Margin="0,0,6,0"
               Background="#2e7d32" Foreground="White" FontWeight="Bold"/>
-      <Button Grid.Column="4" x:Name="btnStop" Content="Stop" Width="90" Height="26"
+      <Button Grid.Column="5" x:Name="btnStop" Content="Stop" Width="90" Height="26"
               Background="#7d2e2e" Foreground="White" FontWeight="Bold" IsEnabled="False"/>
     </Grid>
 
@@ -314,6 +316,45 @@ function Remove-UpnpMappings {
     } catch { }
     $script:upnpMappings   = @()
     $script:upnpExternalIp = $null
+}
+
+# --- Public (internet-visible) IP resolution -----------------------------------
+# Ask an external echo service what our internet-facing IP is. Works regardless
+# of UPnP, as long as outbound HTTPS is allowed. Several endpoints are tried for
+# resilience; the first that answers a valid address wins.
+
+function Get-PublicIP {
+    $endpoints = @(
+        'https://api.ipify.org',
+        'https://checkip.amazonaws.com',
+        'https://ifconfig.me/ip',
+        'https://icanhazip.com'
+    )
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+    foreach ($url in $endpoints) {
+        try {
+            $resp = Invoke-RestMethod -Uri $url -TimeoutSec 4
+            $ip = ("$resp").Trim()
+            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$' -or ($ip -match ':' -and $ip -match '^[0-9a-fA-F:]+$')) {
+                return [pscustomobject]@{ Ip = $ip; Source = ([Uri]$url).Host }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Resolve-AndShowPublicIP {
+    $r = Get-PublicIP
+    if ($r) {
+        Add-Log ("Public (internet) IP: {0}   [via {1}]" -f $r.Ip, $r.Source)
+        $script:lblExtra.Text = "Public IP: $($r.Ip)"
+        return $r.Ip
+    }
+    Add-Log "Could not resolve public IP (no outbound internet, or the lookup services are blocked)."
+    return $null
 }
 
 function Reset-Graph {
@@ -500,7 +541,7 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     foreach ($ctl in @($rbClient,$rbServer,$rbTcp,$rbUdp,$txtHost,$txtPort,$txtTime,
                        $txtParallel,$txtInterval,$txtBitrate,$txtWindow,$chkReverse,
-                       $chkBidir,$chkNat,$chkUpnp,$txtExtra,$txtIperf,$btnBrowse)) {
+                       $chkBidir,$chkNat,$chkUpnp,$txtExtra,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
     if (-not $on) {
@@ -617,6 +658,10 @@ function Start-Run {
         }
     }
 
+    if ($rbServer.IsChecked -and -not $script:upnpExternalIp) {
+        Add-Log "Tip: click 'Public IP' to get the internet address remote clients should connect to."
+    }
+
     $lblStatus.Text = if ($rbServer.IsChecked) { 'Server running - waiting for clients...' } else { 'Test running...' }
     $script:timer.Start()
 }
@@ -654,6 +699,21 @@ $script:timer.Add_Tick({
 
 $btnRun.Add_Click({ Start-Run })
 $btnStop.Add_Click({ Stop-Run 'Stopped by user.' })
+
+$btnPubIp.Add_Click({
+    $btnPubIp.IsEnabled = $false
+    $lblStatus.Text = 'Resolving public IP...'
+    # let the status text repaint before the (brief, blocking) web call
+    $win.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+    $ip = Resolve-AndShowPublicIP
+    if ($ip) {
+        try { [System.Windows.Clipboard]::SetText($ip) } catch { }
+        $lblStatus.Text = "Public IP: $ip  (copied to clipboard)"
+    } else {
+        $lblStatus.Text = 'Public IP lookup failed.'
+    }
+    $btnPubIp.IsEnabled = $true
+})
 
 $btnBrowse.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
