@@ -82,7 +82,7 @@ $script:IperfPath = Find-Iperf
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
-      <RowDefinition Height="240" MinHeight="120"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
@@ -188,8 +188,11 @@ $script:IperfPath = Find-Iperf
     </Border>
 
     <!-- Row 4: log -->
-    <TextBox Grid.Row="4" x:Name="txtLog" Margin="0,0,0,6" IsReadOnly="True"
-             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+    <!-- Height set explicitly to override the shared 24px TextBox style (that
+         height is meant for the single-line inputs, not this multi-line log). -->
+    <TextBox Grid.Row="4" x:Name="txtLog" Margin="0,0,0,6" IsReadOnly="True" Height="240"
+             VerticalScrollBarVisibility="Visible" HorizontalScrollBarVisibility="Auto"
+             VerticalContentAlignment="Top"
              FontFamily="Consolas" FontSize="13" Background="#15151f" Foreground="#c0c0d0"
              TextWrapping="NoWrap"/>
 
