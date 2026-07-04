@@ -259,6 +259,8 @@ $script:timer     = New-Object System.Windows.Threading.DispatcherTimer
 $script:timer.Interval = [TimeSpan]::FromMilliseconds(200)
 $script:upnpMappings   = @()      # list of @{Port=;Protocol=} we created on the router
 $script:upnpExternalIp = $null    # WAN IP reported by the IGD, if any
+$script:upnpCtl        = $null    # discovered IGD SOAP control URL
+$script:upnpSvc        = $null    # discovered IGD WAN service type
 $script:qosProc        = $null    # elevated New/Remove-NetQosPolicy process
 $script:qosFile        = $null    # temp file the elevated process writes its result to
 $script:qosTimer       = $null
@@ -312,53 +314,137 @@ function Get-LocalIPv4 {
     } catch { return $null }
 }
 
+# Discover the IGD's WAN-connection SOAP control endpoint via SSDP. We bind the
+# discovery socket to the LAN interface that reaches the gateway; this is the key
+# fix - the Windows COM UPnP API (HNetCfg.NATUPnP) silently probes the wrong
+# adapter on machines that have extra virtual NICs (VirtualBox/VMware/Hyper-V) and
+# then reports "no device" even though the router supports UPnP.
+function Find-IgdControl([string]$localIP) {
+    if (-not $localIP) { $localIP = Get-LocalIPv4 }
+    if (-not $localIP) { return $null }
+
+    $locations = New-Object System.Collections.Generic.List[string]
+    $udp = $null
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $udp.Client.SetSocketOption('Socket','ReuseAddress',$true)
+        $udp.Client.Bind((New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse($localIP),0)))
+        $udp.Client.ReceiveTimeout = 1500
+        $ep = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Parse('239.255.255.250'),1900)
+        foreach ($st in @('urn:schemas-upnp-org:device:InternetGatewayDevice:1',
+                          'urn:schemas-upnp-org:service:WANIPConnection:1',
+                          'urn:schemas-upnp-org:service:WANPPPConnection:1')) {
+            $msg = "M-SEARCH * HTTP/1.1`r`nHOST: 239.255.255.250:1900`r`nMAN: `"ssdp:discover`"`r`nMX: 2`r`nST: $st`r`n`r`n"
+            $bytes = [Text.Encoding]::ASCII.GetBytes($msg)
+            [void]$udp.Send($bytes, $bytes.Length, $ep)
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 2.5) {
+            try {
+                $r = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any,0)
+                $d = $udp.Receive([ref]$r)
+                $t = [Text.Encoding]::ASCII.GetString($d)
+                $loc = (($t -split "`r?`n") | Where-Object { $_ -match '^LOCATION:' }) -replace '^LOCATION:\s*',''
+                if ($loc -and -not $locations.Contains($loc)) { $locations.Add($loc) }
+            } catch { break }   # receive timeout
+        }
+    } catch { } finally { if ($udp) { $udp.Close() } }
+
+    # Use explicit node selection (not dotted property access) so this stays safe
+    # under Set-StrictMode: e.g. a device description with no <URLBase> element
+    # would otherwise throw "property not found" and get skipped.
+    foreach ($loc in $locations) {
+        try {
+            $desc = Invoke-WebRequest -Uri $loc -UseBasicParsing -TimeoutSec 5
+            [xml]$xml = $desc.Content
+            $svcNode = $xml.SelectNodes("//*[local-name()='service']") | Where-Object {
+                $st = $_.SelectSingleNode("*[local-name()='serviceType']")
+                $st -and ($st.InnerText -match 'WANIPConnection|WANPPPConnection')
+            } | Select-Object -First 1
+            if ($svcNode) {
+                $svcType = $svcNode.SelectSingleNode("*[local-name()='serviceType']").InnerText
+                $cuNode  = $svcNode.SelectSingleNode("*[local-name()='controlURL']")
+                $ctrl    = if ($cuNode) { $cuNode.InnerText } else { '' }
+                $u = [Uri]$loc
+                $base = "{0}://{1}:{2}" -f $u.Scheme, $u.Host, $u.Port
+                $ubNode = $xml.SelectSingleNode("//*[local-name()='URLBase']")
+                if ($ubNode -and $ubNode.InnerText) { $base = $ubNode.InnerText.TrimEnd('/') }
+                if ($ctrl -and $ctrl -notmatch '^https?://') {
+                    if (-not $ctrl.StartsWith('/')) { $ctrl = '/' + $ctrl }
+                    $ctrl = $base.TrimEnd('/') + $ctrl
+                }
+                if ($ctrl) {
+                    return [pscustomobject]@{ ControlUrl = $ctrl; ServiceType = $svcType }
+                }
+            }
+        } catch { }
+    }
+    return $null
+}
+
+function Invoke-UpnpSoap($ctl, $svc, $action, $innerXml) {
+    $body = "<?xml version=`"1.0`"?>" +
+            "<s:Envelope xmlns:s=`"http://schemas.xmlsoap.org/soap/envelope/`" " +
+            "s:encodingStyle=`"http://schemas.xmlsoap.org/soap/encoding/`">" +
+            "<s:Body><u:$action xmlns:u=`"$svc`">$innerXml</u:$action></s:Body></s:Envelope>"
+    $headers = @{ 'SOAPAction' = "`"$svc#$action`""; 'Content-Type' = 'text/xml; charset="utf-8"' }
+    return Invoke-WebRequest -Uri $ctl -Method Post -Headers $headers -Body $body -UseBasicParsing -TimeoutSec 6
+}
+
 function Add-UpnpMapping {
     param([int]$Port, [string[]]$Protocols, [string]$LocalIP, [string]$Desc)
     $res = [pscustomobject]@{ Ok = $false; External = $null; Mapped = @(); Error = $null }
-    $nat = $null
-    try { $nat = New-Object -ComObject HNetCfg.NATUPnP }
-    catch { $res.Error = "UPnP COM interface unavailable: $($_.Exception.Message)"; return $res }
 
-    $coll = $null
-    try { $coll = $nat.StaticPortMappingCollection } catch { }
-    if ($null -eq $coll) {
-        $res.Error = "no UPnP IGD device found (router UPnP disabled or unsupported)"
+    $igd = Find-IgdControl $LocalIP
+    if (-not $igd) {
+        $res.Error = "no UPnP IGD found on this network (router UPnP disabled, blocked, or on another subnet)"
         return $res
     }
+    $script:upnpCtl = $igd.ControlUrl
+    $script:upnpSvc = $igd.ServiceType
 
     $mapped = New-Object System.Collections.Generic.List[object]
     foreach ($proto in $Protocols) {
+        $inner = "<NewRemoteHost></NewRemoteHost><NewExternalPort>$Port</NewExternalPort>" +
+                 "<NewProtocol>$proto</NewProtocol><NewInternalPort>$Port</NewInternalPort>" +
+                 "<NewInternalClient>$LocalIP</NewInternalClient><NewEnabled>1</NewEnabled>" +
+                 "<NewPortMappingDescription>$Desc</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration>"
         try {
-            try { $coll.Remove($Port, $proto) } catch { }   # clear any stale mapping
-            $m = $coll.Add($Port, $proto, $Port, $LocalIP, $true, $Desc)
+            [void](Invoke-UpnpSoap $igd.ControlUrl $igd.ServiceType 'AddPortMapping' $inner)
             [void]$mapped.Add(@{ Port = $Port; Protocol = $proto })
-            if (-not $res.External) { try { $res.External = $m.ExternalIPAddress } catch { } }
         } catch {
-            $res.Error = "failed to map $proto/$Port ($($_.Exception.Message))"
+            $detail = $_.Exception.Message
+            try { if ($_.Exception.Response) { $detail = (New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())).ReadToEnd() } } catch { }
+            $res.Error = "AddPortMapping $proto/$Port failed: $detail"
         }
     }
     $res.Mapped = $mapped
     $res.Ok = ($mapped.Count -gt 0)
-    if ($res.Ok -and -not $res.External) {
-        try { foreach ($e in $coll) { if ($e.ExternalIPAddress) { $res.External = $e.ExternalIPAddress; break } } } catch { }
+    if ($res.Ok) {
+        try {
+            $r = Invoke-UpnpSoap $igd.ControlUrl $igd.ServiceType 'GetExternalIPAddress' ''
+            [xml]$xr = $r.Content
+            $node = $xr.SelectSingleNode("//*[local-name()='NewExternalIPAddress']")
+            if ($node) { $res.External = $node.InnerText }
+        } catch { }
     }
     return $res
 }
 
 function Remove-UpnpMappings {
-    if (-not $script:upnpMappings -or @($script:upnpMappings).Count -eq 0) { return }
-    try {
-        $nat  = New-Object -ComObject HNetCfg.NATUPnP
-        $coll = $nat.StaticPortMappingCollection
-        if ($coll) {
-            foreach ($mp in $script:upnpMappings) {
-                try { $coll.Remove([int]$mp.Port, [string]$mp.Protocol) } catch { }
-            }
-            Add-Log ("UPnP: removed router port mapping(s).")
+    # Note: use .Count directly (not @(...).Count) - wrapping a generic List in
+    # @() and taking .Count throws "Argument types do not match" under StrictMode.
+    if (-not $script:upnpMappings -or $script:upnpMappings.Count -eq 0) { return }
+    if ($script:upnpCtl -and $script:upnpSvc) {
+        foreach ($mp in $script:upnpMappings) {
+            $inner = "<NewRemoteHost></NewRemoteHost><NewExternalPort>$($mp.Port)</NewExternalPort><NewProtocol>$($mp.Protocol)</NewProtocol>"
+            try { [void](Invoke-UpnpSoap $script:upnpCtl $script:upnpSvc 'DeletePortMapping' $inner) } catch { }
         }
-    } catch { }
+        Add-Log "UPnP: removed router port mapping(s)."
+    }
     $script:upnpMappings   = @()
     $script:upnpExternalIp = $null
+    $script:upnpCtl = $null; $script:upnpSvc = $null
 }
 
 # --- Public (internet-visible) IP resolution -----------------------------------

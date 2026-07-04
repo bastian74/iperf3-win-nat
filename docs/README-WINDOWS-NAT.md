@@ -309,6 +309,13 @@ should connect to. When you Stop the server (or close the GUI) the mapping is
 removed again. If UDP is selected, both the TCP and UDP port are mapped (the
 control channel is always TCP).
 
+Discovery uses a direct SSDP + SOAP implementation (like miniupnpc) **bound to the
+LAN interface that reaches your gateway**. That binding matters: the older Windows
+COM UPnP API (`HNetCfg.NATUPnP`) silently probes the wrong adapter on machines
+that have extra virtual NICs (VirtualBox/VMware/Hyper-V) and then reports "no
+device" even though the router supports UPnP — which is the usual reason UPnP
+"doesn't work" on a dev machine. This build avoids that.
+
 Caveats, stated honestly:
 
 * **The router must have UPnP IGD enabled.** Many home routers do by default;
