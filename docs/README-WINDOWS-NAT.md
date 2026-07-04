@@ -210,6 +210,38 @@ What it exposes:
   (its per-stream RTT comes from Linux `TCP_INFO`, which isn't in the Windows
   build). For latency, use **Heartbeat mode** below.
 
+### VoIP call simulation (MOS)
+
+**VoIP** mode simulates concurrent VoIP calls and estimates call quality. Pick a
+**codec** (G.711/G.722/G.729/Opus), the number of **concurrent calls**, a
+duration, and direction (Up/Down/Both), point it at an iperf3-nat **server** on
+the far end, and Run. It measures idle latency first (ping), then generates the
+call load and reports **jitter, packet loss, and an estimated MOS** (ITU-T G.107
+E-model R-factor → MOS) with a verdict (Excellent/Good/Fair/Poor/Bad).
+
+Honest modelling note: because parallel UDP is unreliable on the Cygwin runtime,
+the N calls are generated as **one aggregate UDP stream** at N×(per-call rate)
+with codec-sized packets — this reproduces the aggregate bandwidth *and* the
+high packets-per-second load that actually stresses a link for voice, but it is
+not N independent RTP sessions. The MOS is an estimate, not a guarantee. Use it
+for "can this link carry N calls at acceptable quality?" capacity checks.
+
+### Latency under load (bufferbloat)
+
+Tick **Latency under load** on a Client or VoIP test and it pings the target
+*during* the transfer, then reports **idle vs under-load RTT** and a bufferbloat
+grade (A–F). A link can show great Mbps yet balloon from 10 ms idle to 300 ms
+under load — that's bufferbloat, the usual cause of "fast speedtest but laggy
+calls." This is the single most useful troubleshooting readout here.
+
+### CSV logging (auditing)
+
+Tick **Log results to CSV** and give a path; every completed test (throughput,
+VoIP, or heartbeat) appends a row: timestamp, mode, target, protocol, direction,
+streams, duration, TX/RX Mbps, jitter, loss, RTT, MOS, verdict, and notes
+(including the bufferbloat delta). Open it in Excel to chart bandwidth by
+time-of-day or track a link over weeks.
+
 ### Heartbeat / link monitor (latency + uptime, indefinite)
 
 **Heartbeat** mode is a continuous link monitor — the RTT/latency feature iperf3

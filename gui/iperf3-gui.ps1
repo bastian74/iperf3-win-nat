@@ -98,6 +98,8 @@ $script:IperfPath = Find-Iperf
           <RadioButton x:Name="rbServer" Content="Server" GroupName="role"/>
           <RadioButton x:Name="rbHeartbeat" Content="Heartbeat" GroupName="role"
                        ToolTip="Continuous ping/link monitor with live round-trip-time graph"/>
+          <RadioButton x:Name="rbVoip" Content="VoIP" GroupName="role"
+                       ToolTip="Simulate concurrent VoIP calls (UDP) and estimate call quality (MOS)"/>
           <Label Content="Port:" Margin="16,0,0,0"/>
           <TextBox x:Name="txtPort" Width="70" Text="5201"/>
           <Label Content="Interval (-i):" Margin="16,0,0,0"/>
@@ -164,10 +166,44 @@ $script:IperfPath = Find-Iperf
           </StackPanel>
         </Border>
 
+        <!-- VoIP-only options (disabled unless VoIP mode) -->
+        <Border x:Name="grpVoip" BorderBrush="#5a2a5a" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,0,0,2">
+          <StackPanel>
+            <TextBlock Text="VoIP CALL SIMULATION" Foreground="#c680c6" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
+            <StackPanel Orientation="Horizontal">
+              <Label Content="Server:"/>
+              <TextBox x:Name="txtVoipHost" Width="150" Text="" ToolTip="iperf3 server host (start iperf3-nat in Server mode on the far end)"/>
+              <Label Content="Codec:" Margin="12,0,0,0"/>
+              <ComboBox x:Name="cmbCodec" Width="105" SelectedIndex="0">
+                <ComboBoxItem>G.711 (64k)</ComboBoxItem>
+                <ComboBoxItem>G.722 (64k)</ComboBoxItem>
+                <ComboBoxItem>G.729 (8k)</ComboBoxItem>
+                <ComboBoxItem>Opus (48k)</ComboBoxItem>
+              </ComboBox>
+              <Label Content="Calls:" Margin="12,0,0,0"/>
+              <TextBox x:Name="txtVoipCalls" Width="45" Text="10" ToolTip="Number of concurrent calls to simulate (aggregate load)"/>
+              <Label Content="Duration:" Margin="12,0,0,0"/>
+              <TextBox x:Name="txtVoipTime" Width="45" Text="15"/><Label Content="s"/>
+              <Label Content="Direction:" Margin="12,0,0,0"/>
+              <RadioButton x:Name="rbVoipUp" Content="Up" IsChecked="True" GroupName="voipdir"/>
+              <RadioButton x:Name="rbVoipDown" Content="Down" GroupName="voipdir"/>
+              <RadioButton x:Name="rbVoipBoth" Content="Both" GroupName="voipdir"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
         <!-- Common: extra args passthrough -->
         <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
           <Label Content="Extra args:"/>
-          <TextBox x:Name="txtExtra" Width="420" Text="" ToolTip="Any additional iperf3 flags, passed through verbatim"/>
+          <TextBox x:Name="txtExtra" Width="300" Text="" ToolTip="Any additional iperf3 flags, passed through verbatim"/>
+          <CheckBox x:Name="chkLoadLatency" Content="Latency under load (bufferbloat)" Margin="16,0,0,0"
+                    ToolTip="Ping the target during the throughput/VoIP test to measure idle-vs-loaded latency"/>
+        </StackPanel>
+
+        <!-- Common: CSV result logging -->
+        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+          <CheckBox x:Name="chkCsv" Content="Log results to CSV:" VerticalAlignment="Center"/>
+          <TextBox x:Name="txtCsvPath" Width="380" Margin="6,0,0,0" ToolTip="Every completed test appends a row here (created if missing)"/>
         </StackPanel>
 
         <!-- Common: Windows QoS / DSCP marking (applies to whichever side sends) -->
@@ -245,6 +281,7 @@ $xaml.SelectNodes("//*[@*[local-name()='Name']]") | ForEach-Object {
 }
 
 $txtIperf.Text = if ($script:IperfPath) { $script:IperfPath } else { '' }
+$txtCsvPath.Text = [IO.Path]::Combine([Environment]::GetFolderPath('MyDocuments'), 'iperf3-nat-log.csv')
 
 # ---------------------------------------------------------------------------
 # State
@@ -275,6 +312,52 @@ $script:hbHandle  = $null
 $script:hbTimer   = $null         # UI-thread drain timer
 $script:hbSent = 0; $script:hbRecv = 0; $script:hbLost = 0
 $script:hbConsec = 0; $script:hbMin = $null; $script:hbMax = 0.0
+# Test bookkeeping for reporting / CSV
+$script:testKind   = 'iperf'   # 'iperf' | 'voip' | 'path'
+$script:idleRtt    = $null     # pre-test RTT stats (for MOS + bufferbloat baseline)
+$script:lastResult = @{}       # accumulated fields for the CSV row
+$script:voipCalls  = 0
+$script:voipCodec  = ''
+# Concurrent load-latency (bufferbloat) pinger - separate from heartbeat
+$script:llControl = $null; $script:llQueue = $null; $script:llPS = $null
+$script:llRS = $null; $script:llHandle = $null
+# Path/pathping worker
+$script:pathControl = $null; $script:pathQueue = $null; $script:pathPS = $null
+$script:pathRS = $null; $script:pathHandle = $null; $script:pathTimer = $null
+
+# Shared background ping worker (used by Heartbeat and by load-latency).
+$script:pingWorker = {
+    param($queue, $control, $target, $intervalMs, $timeoutMs, $method, $port)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    while (-not $control.Stop) {
+        $t = $sw.Elapsed.TotalSeconds
+        $ok = $false; $rtt = 0.0
+        try {
+            if ($method -eq 'tcp') {
+                $cli = New-Object System.Net.Sockets.TcpClient
+                $s2 = [System.Diagnostics.Stopwatch]::StartNew()
+                $iar = $cli.BeginConnect($target, $port, $null, $null)
+                if ($iar.AsyncWaitHandle.WaitOne($timeoutMs)) {
+                    try { $cli.EndConnect($iar); $ok = $true; $rtt = $s2.Elapsed.TotalMilliseconds } catch { }
+                }
+                $cli.Close()
+            } else {
+                $r = $ping.Send($target, $timeoutMs)
+                if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                    $ok = $true; $rtt = [double]$r.RoundtripTime
+                }
+            }
+        } catch { }
+        $queue.Enqueue([pscustomobject]@{ T = $t; Ok = $ok; Rtt = $rtt })
+        $slept = 0
+        while (-not $control.Stop -and $slept -lt $intervalMs) {
+            $step = [Math]::Min(50, $intervalMs - $slept)
+            Start-Sleep -Milliseconds $step
+            $slept += $step
+        }
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -749,46 +832,12 @@ function Start-Heartbeat {
     $script:hbControl = [hashtable]::Synchronized(@{ Stop = $false })
     $script:hbQueue   = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
 
-    $worker = {
-        param($queue, $control, $target, $intervalMs, $timeoutMs, $method, $port)
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        while (-not $control.Stop) {
-            $t = $sw.Elapsed.TotalSeconds
-            $ok = $false; $rtt = 0.0
-            try {
-                if ($method -eq 'tcp') {
-                    $cli = New-Object System.Net.Sockets.TcpClient
-                    $s2 = [System.Diagnostics.Stopwatch]::StartNew()
-                    $iar = $cli.BeginConnect($target, $port, $null, $null)
-                    if ($iar.AsyncWaitHandle.WaitOne($timeoutMs)) {
-                        try { $cli.EndConnect($iar); $ok = $true; $rtt = $s2.Elapsed.TotalMilliseconds } catch { }
-                    }
-                    $cli.Close()
-                } else {
-                    $r = $ping.Send($target, $timeoutMs)
-                    if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
-                        $ok = $true; $rtt = [double]$r.RoundtripTime
-                    }
-                }
-            } catch { }
-            $queue.Enqueue([pscustomobject]@{ T = $t; Ok = $ok; Rtt = $rtt })
-            # sleep the interval but wake often so Stop is responsive
-            $slept = 0
-            while (-not $control.Stop -and $slept -lt $intervalMs) {
-                $step = [Math]::Min(50, $intervalMs - $slept)
-                Start-Sleep -Milliseconds $step
-                $slept += $step
-            }
-        }
-    }
-
     $script:hbRS = [runspacefactory]::CreateRunspace()
     try { $script:hbRS.ApartmentState = 'MTA' } catch { }
     $script:hbRS.Open()
     $script:hbPS = [powershell]::Create()
     $script:hbPS.Runspace = $script:hbRS
-    [void]$script:hbPS.AddScript($worker).AddArgument($script:hbQueue).AddArgument($script:hbControl).
+    [void]$script:hbPS.AddScript($script:pingWorker).AddArgument($script:hbQueue).AddArgument($script:hbControl).
         AddArgument($target).AddArgument($interval).AddArgument($timeout).AddArgument($method).AddArgument($port)
     $script:hbHandle = $script:hbPS.BeginInvoke()
 
@@ -848,14 +897,132 @@ function Stop-Heartbeat {
         Add-Log ("Heartbeat stopped: {0} probes, {1} replies, loss {2:N1}%{3}" -f `
                  $script:hbSent, $script:hbRecv, $loss,
                  $(if ($script:hbMin -ne $null) { (', RTT min/max {0:N1}/{1:N1} ms' -f $script:hbMin, $script:hbMax) } else { '' }))
+        $avg = ''
+        if ($script:series.Contains('RTT') -and $script:series['RTT'].Count -gt 0) {
+            $avg = [Math]::Round($script:series['RTT'].Sum / $script:series['RTT'].Count, 1)
+        }
+        Write-CsvRow @{
+            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); Mode = 'heartbeat'
+            Target = $txtHbHost.Text.Trim(); Protocol = $(if ($rbHbTcp.IsChecked) { 'TCP' } else { 'ICMP' })
+            RTT_ms = $avg; Loss_pct = [Math]::Round($loss, 2)
+            Notes = ("probes={0} min/max={1:N1}/{2:N1}ms" -f $script:hbSent, $script:hbMin, $script:hbMax)
+        }
     }
     $script:graphUnit = 'mbps'
+}
+
+# --- VoIP modelling + quality (E-model MOS) ------------------------------------
+# Per-call on-wire bitrate (kbps), packet size (bytes), and G.113 impairment
+# factors Ie (equipment) / Bpl (packet-loss robustness) for common codecs.
+function Get-Codec([string]$name) {
+    switch -Wildcard ($name) {
+        'G.711*' { return @{ Kbps = 87;  Pkt = 200; Ie = 0;  Bpl = 25.1; Pps = 50 } }
+        'G.722*' { return @{ Kbps = 87;  Pkt = 200; Ie = 0;  Bpl = 25.1; Pps = 50 } }
+        'G.729*' { return @{ Kbps = 31;  Pkt = 78;  Ie = 11; Bpl = 19.0; Pps = 50 } }
+        'Opus*'  { return @{ Kbps = 66;  Pkt = 160; Ie = 7;  Bpl = 20.0; Pps = 50 } }
+        default  { return @{ Kbps = 87;  Pkt = 200; Ie = 0;  Bpl = 25.1; Pps = 50 } }
+    }
+}
+
+# Simplified ITU-T G.107 E-model -> R factor and MOS estimate.
+function Compute-Mos([double]$OneWayMs, [double]$JitterMs, [double]$LossPct, [double]$Ie, [double]$Bpl) {
+    $d = $OneWayMs + (2.0 * $JitterMs) + 10.0            # effective mouth-to-ear delay
+    $Id = 0.024 * $d
+    if ($d -gt 177.3) { $Id += 0.11 * ($d - 177.3) }
+    $Ieeff = $Ie + (95.0 - $Ie) * ($LossPct / ($LossPct + $Bpl))
+    $R = 93.2 - $Id - $Ieeff
+    if ($R -lt 0) { $mos = 1.0 } elseif ($R -gt 100) { $mos = 4.5 }
+    else { $mos = 1 + 0.035*$R + 7e-6*$R*($R-60)*(100-$R) }
+    if ($mos -lt 1) { $mos = 1.0 }; if ($mos -gt 4.5) { $mos = 4.5 }
+    return [pscustomobject]@{ R = [Math]::Round($R,1); MOS = [Math]::Round($mos,2) }
+}
+
+function Mos-Verdict([double]$m) {
+    if ($m -ge 4.3) { 'Excellent' } elseif ($m -ge 4.0) { 'Good' }
+    elseif ($m -ge 3.6) { 'Fair' } elseif ($m -ge 3.1) { 'Poor' } else { 'Bad' }
+}
+
+function Bloat-Grade([double]$deltaMs) {
+    if ($deltaMs -lt 5) { 'A (excellent)' } elseif ($deltaMs -lt 30) { 'B (good)' }
+    elseif ($deltaMs -lt 60) { 'C (fair)' } elseif ($deltaMs -lt 100) { 'D (poor)' } else { 'F (bad)' }
+}
+
+# --- CSV result logging --------------------------------------------------------
+function Write-CsvRow([hashtable]$row) {
+    if (-not $chkCsv.IsChecked) { return }
+    $path = $txtCsvPath.Text.Trim()
+    if (-not $path) { return }
+    $cols = @('Timestamp','Mode','Target','Protocol','Direction','Streams','DurationS',
+              'TX_Mbps','RX_Mbps','Jitter_ms','Loss_pct','RTT_ms','MOS','Verdict','Notes')
+    try {
+        if (-not (Test-Path $path)) { ($cols -join ',') | Out-File -FilePath $path -Encoding utf8 }
+        $vals = foreach ($c in $cols) {
+            $v = if ($row.ContainsKey($c)) { [string]$row[$c] } else { '' }
+            '"' + ($v -replace '"','""') + '"'
+        }
+        ($vals -join ',') | Out-File -FilePath $path -Append -Encoding utf8
+        Add-Log ("Logged result to CSV: {0}" -f $path)
+    } catch { Add-Log ("CSV log error: {0}" -f $_.Exception.Message) }
+}
+
+# --- Latency measurement -------------------------------------------------------
+# Quick synchronous RTT sample (used before a test for the idle baseline).
+function Measure-Rtt([string]$target, [int]$count = 4, [int]$timeout = 1000) {
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    $rtts = New-Object System.Collections.Generic.List[double]
+    for ($i = 0; $i -lt $count; $i++) {
+        try { $r = $ping.Send($target, $timeout); if ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $rtts.Add([double]$r.RoundtripTime) } } catch { }
+        Start-Sleep -Milliseconds 150
+    }
+    if ($rtts.Count -eq 0) { return $null }
+    return [pscustomobject]@{
+        Avg = ($rtts | Measure-Object -Average).Average
+        Max = ($rtts | Measure-Object -Maximum).Maximum
+        Min = ($rtts | Measure-Object -Minimum).Minimum
+        Count = $rtts.Count
+    }
+}
+
+# Concurrent pinger that runs DURING a throughput/VoIP test (bufferbloat probe).
+function Start-LoadPing([string]$target, [int]$intervalMs = 200) {
+    $script:llControl = [hashtable]::Synchronized(@{ Stop = $false })
+    $script:llQueue   = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+    $script:llRS = [runspacefactory]::CreateRunspace()
+    try { $script:llRS.ApartmentState = 'MTA' } catch { }
+    $script:llRS.Open()
+    $script:llPS = [powershell]::Create(); $script:llPS.Runspace = $script:llRS
+    [void]$script:llPS.AddScript($script:pingWorker).AddArgument($script:llQueue).AddArgument($script:llControl).
+        AddArgument($target).AddArgument($intervalMs).AddArgument(1000).AddArgument('icmp').AddArgument(0)
+    $script:llHandle = $script:llPS.BeginInvoke()
+}
+
+function Stop-LoadPing {
+    if (-not $script:llControl) { return $null }
+    $script:llControl.Stop = $true
+    Start-Sleep -Milliseconds 80
+    $rtts = New-Object System.Collections.Generic.List[double]
+    if ($script:llQueue) { while ($script:llQueue.Count -gt 0) { $it = $script:llQueue.Dequeue(); if ($it.Ok) { $rtts.Add([double]$it.Rtt) } } }
+    if ($script:llPS) { try { if ($script:llHandle) { $script:llPS.EndInvoke($script:llHandle) } } catch { }; try { $script:llPS.Dispose() } catch { } }
+    if ($script:llRS) { try { $script:llRS.Close(); $script:llRS.Dispose() } catch { } }
+    $script:llControl = $null; $script:llQueue = $null; $script:llPS = $null; $script:llRS = $null; $script:llHandle = $null
+    if ($rtts.Count -eq 0) { return $null }
+    return [pscustomobject]@{
+        Avg = ($rtts | Measure-Object -Average).Average
+        Max = ($rtts | Measure-Object -Maximum).Maximum
+        Count = $rtts.Count
+    }
 }
 
 # Direction label for a "sum" object: TX = this host is sending, RX = receiving.
 function Dir-Label($sumObj) {
     if ($sumObj -and ($sumObj.PSObject.Properties.Name -contains 'sender') -and $sumObj.sender) { return 'TX' }
     return 'RX'
+}
+
+# StrictMode-safe field access on a parsed JSON object.
+function Get-Field($o, [string]$name) {
+    if ($o -and ($o.PSObject.Properties.Name -contains $name) -and ($null -ne $o.$name)) { return $o.$name }
+    return $null
 }
 
 # Extra per-interval detail: jitter/loss for UDP, retransmits for TCP.
@@ -930,6 +1097,37 @@ function Process-Line([string]$line) {
                              $(if ($x) { "   $x" } else { '' }))
                 }
             }
+
+            # Capture metrics for reporting / CSV.
+            $sent = Get-Field $d 'sum_sent'
+            $recv = Get-Field $d 'sum_received'
+            $jit  = Get-Field $recv 'jitter_ms';    if ($null -eq $jit)  { $jit  = Get-Field $sent 'jitter_ms' }
+            $loss = Get-Field $recv 'lost_percent'; if ($null -eq $loss) { $loss = Get-Field $sent 'lost_percent' }
+            if ($sent) { $script:lastResult['TX_Mbps'] = [Math]::Round([double]$sent.bits_per_second/1e6, 3) }
+            if ($recv) { $script:lastResult['RX_Mbps'] = [Math]::Round([double]$recv.bits_per_second/1e6, 3) }
+            if ($null -ne $jit)  { $script:lastResult['Jitter_ms'] = [Math]::Round([double]$jit, 3) }
+            if ($null -ne $loss) { $script:lastResult['Loss_pct']  = [Math]::Round([double]$loss, 2) }
+
+            # VoIP: estimate call quality (MOS) from delay + jitter + loss.
+            if ($script:testKind -eq 'voip') {
+                $oneway = if ($script:idleRtt) { $script:idleRtt.Avg / 2.0 } else { 0.0 }
+                $jm = if ($null -ne $jit) { [double]$jit } else { 0.0 }
+                $lp = if ($null -ne $loss) { [double]$loss } else { 0.0 }
+                $codecName = if ($cmbCodec.SelectedItem) { [string]$cmbCodec.SelectedItem.Content } else { 'G.711' }
+                $codec = Get-Codec $codecName
+                $m = Compute-Mos $oneway $jm $lp $codec.Ie $codec.Bpl
+                $verdict = Mos-Verdict $m.MOS
+                $calls = 10; [void][int]::TryParse($txtVoipCalls.Text.Trim(), [ref]$calls)
+                Add-Log "==================== VoIP RESULT ===================="
+                Add-Log ("Codec {0}: {1} concurrent calls  (~{2} kbps/call, {3} kbps aggregate)" -f `
+                         $codecName, $calls, $codec.Kbps, ($codec.Kbps * $calls))
+                Add-Log ("One-way delay ~{0:N1} ms | jitter {1:N2} ms | loss {2:N2}%" -f $oneway, $jm, $lp)
+                Add-Log ("Estimated MOS {0}  (R-factor {1})  ->  {2}" -f $m.MOS, $m.R, $verdict)
+                Add-Log "====================================================="
+                $script:lastResult['MOS']     = $m.MOS
+                $script:lastResult['Verdict'] = $verdict
+                $script:lastResult['Notes']   = "codec=$codecName calls=$calls (aggregate model)"
+            }
         }
         default {
             Add-Log $line
@@ -965,14 +1163,37 @@ function Set-Running([bool]$on) {
     $script:btnStop.IsEnabled = $on
     # Group containers (grpClient/grpServer) disable all their children via WPF
     # IsEnabled propagation, so we only toggle the containers + the common controls.
-    foreach ($ctl in @($rbClient,$rbServer,$rbHeartbeat,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
-                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$grpHeartbeat,$txtIperf,$btnBrowse,$btnPubIp)) {
+    foreach ($ctl in @($rbClient,$rbServer,$rbHeartbeat,$rbVoip,$txtPort,$txtInterval,$chkNat,$txtExtra,$txtDscp,
+                       $btnQosApply,$btnQosClear,$grpClient,$grpServer,$grpHeartbeat,$grpVoip,
+                       $chkLoadLatency,$chkCsv,$txtCsvPath,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
     if (-not $on) { & $script:updateRole }   # re-apply which role's group is active
 }
 
+function Build-VoipArgs {
+    $a = New-Object System.Collections.Generic.List[string]
+    $codecName = if ($cmbCodec.SelectedItem) { [string]$cmbCodec.SelectedItem.Content } else { 'G.711' }
+    $codec = Get-Codec $codecName
+    $calls = 10; [void][int]::TryParse($txtVoipCalls.Text.Trim(), [ref]$calls); if ($calls -lt 1) { $calls = 1 }
+    $totalKbps = [int]$codec.Kbps * $calls
+    $a.Add('-c'); $a.Add($txtVoipHost.Text.Trim())
+    if ($txtPort.Text.Trim()) { $a.Add('-p'); $a.Add($txtPort.Text.Trim()) }
+    $a.Add('-u')
+    # N concurrent calls modelled as one aggregate UDP stream (parallel UDP is
+    # unreliable on the Cygwin runtime): N x per-call rate, codec-sized packets.
+    $a.Add('-b'); $a.Add(($totalKbps.ToString() + 'K'))
+    $a.Add('-l'); $a.Add([string]$codec.Pkt)
+    $t = 15; [void][int]::TryParse($txtVoipTime.Text.Trim(), [ref]$t); $a.Add('-t'); $a.Add([string]$t)
+    if ($txtInterval.Text.Trim()) { $a.Add('-i'); $a.Add($txtInterval.Text.Trim()) }
+    if ($rbVoipDown.IsChecked) { $a.Add('-R') } elseif ($rbVoipBoth.IsChecked) { $a.Add('--bidir') }
+    if ($chkNat.IsChecked) { $a.Add('--nat') }
+    $a.Add('--json-stream'); $a.Add('--forceflush')
+    return ,$a
+}
+
 function Build-Args {
+    if ($rbVoip.IsChecked) { return ,(Build-VoipArgs) }   # comma: don't unroll the List
     $a = New-Object System.Collections.Generic.List[string]
     $isClient = $rbClient.IsChecked
     if ($isClient) {
@@ -1023,11 +1244,49 @@ function Start-Run {
             "iperf3-nat GUI", 'OK', 'Warning') | Out-Null
         return
     }
+    if ($rbVoip.IsChecked -and -not $txtVoipHost.Text.Trim()) {
+        [System.Windows.MessageBox]::Show("Enter the iperf3 server host for the VoIP test.",
+            "iperf3-nat GUI", 'OK', 'Warning') | Out-Null
+        return
+    }
+
+    $script:testKind = if ($rbVoip.IsChecked) { 'voip' } else { 'iperf' }
+    $script:idleRtt = $null
+
+    # Ping target for idle-baseline / bufferbloat / MOS delay: the far end host.
+    $pingTarget = if ($rbVoip.IsChecked) { $txtVoipHost.Text.Trim() }
+                  elseif ($rbClient.IsChecked) { $txtHost.Text.Trim() } else { '' }
+
+    $dir = if ($rbVoip.IsChecked) {
+               if ($rbVoipDown.IsChecked) { 'down' } elseif ($rbVoipBoth.IsChecked) { 'both' } else { 'up' }
+           } elseif ($chkReverse.IsChecked) { 'down' } elseif ($chkBidir.IsChecked) { 'both' } else { 'up' }
+    $script:lastResult = @{
+        Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        Mode      = $script:testKind
+        Target    = $pingTarget
+        Protocol  = if ($rbVoip.IsChecked -or $rbUdp.IsChecked) { 'UDP' } else { 'TCP' }
+        Direction = $dir
+        Streams   = if ($rbVoip.IsChecked) { $txtVoipCalls.Text.Trim() } else { $txtParallel.Text.Trim() }
+        DurationS = if ($rbVoip.IsChecked) { $txtVoipTime.Text.Trim() } else { $txtTime.Text.Trim() }
+    }
 
     $txtLog.Clear()
     Reset-Graph
     $argList = Build-Args
     $lblCmd.Text = 'iperf3 ' + ($argList -join ' ')
+
+    # Measure idle latency first when VoIP (needed for MOS) or bufferbloat is on.
+    if ($pingTarget -and ($rbVoip.IsChecked -or $chkLoadLatency.IsChecked)) {
+        $lblStatus.Text = 'Measuring idle latency...'
+        $win.Dispatcher.Invoke([action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+        $script:idleRtt = Measure-Rtt $pingTarget 4 1000
+        if ($script:idleRtt) {
+            Add-Log ("Idle latency to {0}: avg {1:N1} ms (min {2:N1}, max {3:N1})" -f `
+                     $pingTarget, $script:idleRtt.Avg, $script:idleRtt.Min, $script:idleRtt.Max)
+        } else {
+            Add-Log ("Idle latency: {0} did not answer ping (MOS delay term will assume 0)." -f $pingTarget)
+        }
+    }
 
     # Route output to a temp file that we tail (decouples the child process from the UI thread)
     $script:logFile = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),
@@ -1053,6 +1312,12 @@ function Start-Run {
     }
     Add-Log ("> " + $exe + " " + $psi.Arguments)
     Set-Running $true
+
+    # Start the concurrent bufferbloat pinger for the duration of the test.
+    if ($pingTarget -and $chkLoadLatency.IsChecked) {
+        Start-LoadPing $pingTarget 200
+        Add-Log "Bufferbloat probe: pinging target during the test..."
+    }
 
     # Server mode: optionally ask the router to forward this port via UPnP so a
     # server behind NAT becomes reachable without a manual port-forward.
@@ -1113,6 +1378,30 @@ function Stop-Run([string]$reason = 'Stopped.') {
         try { $err = $script:proc.StandardError.ReadToEnd() } catch { }
         if ($err) { Add-Log $err }
     }
+
+    # Bufferbloat: stop the concurrent pinger and report idle-vs-loaded latency.
+    if ($script:llControl) {
+        $loaded = Stop-LoadPing
+        if ($script:idleRtt -and $loaded) {
+            $delta = $loaded.Avg - $script:idleRtt.Avg
+            $grade = Bloat-Grade $delta
+            Add-Log "-------- Latency under load (bufferbloat) --------"
+            Add-Log ("Idle avg {0:N1} ms  ->  under load avg {1:N1} ms (max {2:N1})" -f $script:idleRtt.Avg, $loaded.Avg, $loaded.Max)
+            Add-Log ("Bufferbloat: +{0:N1} ms  ->  grade {1}" -f $delta, $grade)
+            Add-Log "--------------------------------------------------"
+            $script:lastResult['Notes'] = (([string]$script:lastResult['Notes']) + (' bufferbloat=+{0:N0}ms/{1}' -f $delta, $grade)).Trim()
+        } elseif ($loaded) {
+            Add-Log ("Under-load latency avg {0:N1} ms (no idle baseline to compare)" -f $loaded.Avg)
+        }
+    }
+    if ($script:idleRtt -and -not $script:lastResult.ContainsKey('RTT_ms')) {
+        $script:lastResult['RTT_ms'] = [Math]::Round($script:idleRtt.Avg, 1)
+    }
+    # Log a CSV row if a test actually produced results.
+    if ($script:lastResult.ContainsKey('TX_Mbps') -or $script:lastResult.ContainsKey('RX_Mbps') -or $script:lastResult.ContainsKey('MOS')) {
+        Write-CsvRow $script:lastResult
+    }
+
     Remove-UpnpMappings
     Set-Running $false
     $lblStatus.Text = $reason
@@ -1170,15 +1459,20 @@ $script:updateRole = {
     $isClient = $rbClient.IsChecked
     $isServer = $rbServer.IsChecked
     $isHb     = $rbHeartbeat.IsChecked
+    $isVoip   = $rbVoip.IsChecked
     $grpClient.IsEnabled    = $isClient          # CLIENT OPTIONS
     $grpServer.IsEnabled    = $isServer          # SERVER OPTIONS
     $grpHeartbeat.IsEnabled = $isHb              # HEARTBEAT
-    # Port/Interval/NAT are iperf3 settings - not used by the heartbeat monitor.
-    foreach ($c in @($txtPort, $txtInterval, $chkNat)) { $c.IsEnabled = ($isClient -or $isServer) }
+    $grpVoip.IsEnabled      = $isVoip            # VoIP
+    # Port/Interval/NAT are iperf3 settings - used by client/server/VoIP, not heartbeat.
+    foreach ($c in @($txtPort, $txtInterval, $chkNat)) { $c.IsEnabled = ($isClient -or $isServer -or $isVoip) }
+    # Bufferbloat probe only makes sense during a throughput/VoIP test.
+    $chkLoadLatency.IsEnabled = ($isClient -or $isVoip)
 }
 $rbClient.Add_Checked($script:updateRole)
 $rbServer.Add_Checked($script:updateRole)
 $rbHeartbeat.Add_Checked($script:updateRole)
+$rbVoip.Add_Checked($script:updateRole)
 & $script:updateRole   # apply once at startup (default is client mode)
 
 $win.Add_Closing({
