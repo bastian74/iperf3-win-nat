@@ -89,70 +89,68 @@ $script:IperfPath = Find-Iperf
     <!-- Row 0: options panel -->
     <Border Grid.Row="0" Background="#26263440" BorderBrush="#3a3a52" BorderThickness="1"
             CornerRadius="4" Padding="8" Margin="0,0,0,6">
-      <Grid>
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/><RowDefinition Height="6"/>
-          <RowDefinition Height="Auto"/><RowDefinition Height="6"/>
-          <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+      <StackPanel>
 
-        <!-- line 1: role + host + port -->
-        <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal">
+        <!-- Common (applies to both roles) -->
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
           <Label Content="Mode:"/>
           <RadioButton x:Name="rbClient" Content="Client" IsChecked="True" GroupName="role"/>
           <RadioButton x:Name="rbServer" Content="Server" GroupName="role"/>
-        </StackPanel>
-        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="16,0,0,0">
-          <Label Content="Host:"/>
-          <TextBox x:Name="txtHost" Width="200" Text="127.0.0.1"/>
-        </StackPanel>
-        <Label Grid.Row="0" Grid.Column="2" Content="Port:"/>
-        <TextBox Grid.Row="0" Grid.Column="3" x:Name="txtPort" Width="70" Text="5201"/>
-        <StackPanel Grid.Row="0" Grid.Column="4" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="16,0,0,0">
-          <Label Content="Protocol:"/>
-          <RadioButton x:Name="rbTcp" Content="TCP" IsChecked="True" GroupName="proto"/>
-          <RadioButton x:Name="rbUdp" Content="UDP" GroupName="proto"/>
-        </StackPanel>
-
-        <!-- line 2: duration, streams, bitrate, window -->
-        <StackPanel Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal">
-          <Label Content="Duration (-t):"/>
-          <TextBox x:Name="txtTime" Width="50" Text="10"/>
-          <Label Content="s" Margin="2,0,12,0"/>
-          <Label Content="Streams (-P):"/>
-          <TextBox x:Name="txtParallel" Width="45" Text="1"/>
-          <Label Content="Interval (-i):" Margin="12,0,0,0"/>
+          <Label Content="Port:" Margin="16,0,0,0"/>
+          <TextBox x:Name="txtPort" Width="70" Text="5201"/>
+          <Label Content="Interval (-i):" Margin="16,0,0,0"/>
           <TextBox x:Name="txtInterval" Width="45" Text="1"/>
           <Label Content="s"/>
-        </StackPanel>
-        <StackPanel Grid.Row="2" Grid.Column="2" Grid.ColumnSpan="4" Orientation="Horizontal" Margin="16,0,0,0">
-          <Label Content="Bitrate (-b):"/>
-          <TextBox x:Name="txtBitrate" Width="58" Text="" ToolTip="Target rate, e.g. 50M. UDP or capped TCP."/>
-          <Label Content="Len (-l):" Margin="10,0,0,0"/>
-          <TextBox x:Name="txtLen" Width="58" Text="" ToolTip="Packet/buffer size: UDP datagram or TCP read/write size, e.g. 1400 or 128K"/>
-          <Label Content="Window (-w):" Margin="10,0,0,0"/>
-          <TextBox x:Name="txtWindow" Width="58" Text=""/>
-          <Label Content="DSCP:" Margin="10,0,0,0"/>
-          <TextBox x:Name="txtDscp" Width="52" Text="" ToolTip="QoS marking, e.g. EF, CS5, AF11 or 0-63. Note: Windows often ignores socket DSCP (see docs)."/>
+          <CheckBox x:Name="chkNat" Content="NAT (--nat)" IsChecked="True" Margin="16,0,0,0"/>
         </StackPanel>
 
-        <!-- line 3: checkboxes + format + extra -->
-        <StackPanel Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal">
-          <CheckBox x:Name="chkReverse" Content="Reverse (-R)"/>
-          <CheckBox x:Name="chkBidir" Content="Bidir (--bidir)"/>
-          <CheckBox x:Name="chkNat" Content="NAT (--nat)" IsChecked="True"/>
-          <CheckBox x:Name="chkUpnp" Content="Auto-forward (UPnP)" ToolTip="Server mode: ask the router to forward this port via UPnP"/>
-        </StackPanel>
-        <StackPanel Grid.Row="4" Grid.Column="3" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="16,0,0,0">
+        <!-- Client-only options (disabled in Server mode) -->
+        <Border x:Name="grpClient" BorderBrush="#3a4a6a" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,2,0,2">
+          <StackPanel>
+            <TextBlock Text="CLIENT OPTIONS" Foreground="#6fa8dc" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
+            <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
+              <Label Content="Host:"/>
+              <TextBox x:Name="txtHost" Width="180" Text="127.0.0.1"/>
+              <Label Content="Protocol:" Margin="12,0,0,0"/>
+              <RadioButton x:Name="rbTcp" Content="TCP" IsChecked="True" GroupName="proto"/>
+              <RadioButton x:Name="rbUdp" Content="UDP" GroupName="proto"/>
+              <Label Content="Duration (-t):" Margin="12,0,0,0"/>
+              <TextBox x:Name="txtTime" Width="45" Text="10"/><Label Content="s"/>
+              <Label Content="Streams (-P):" Margin="12,0,0,0"/>
+              <TextBox x:Name="txtParallel" Width="40" Text="1"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal">
+              <Label Content="Bitrate (-b):"/>
+              <TextBox x:Name="txtBitrate" Width="58" Text="" ToolTip="Target rate, e.g. 50M. UDP or capped TCP."/>
+              <Label Content="Len (-l):" Margin="10,0,0,0"/>
+              <TextBox x:Name="txtLen" Width="58" Text="" ToolTip="Packet/buffer size: UDP datagram or TCP read/write size, e.g. 1400 or 128K"/>
+              <Label Content="Window (-w):" Margin="10,0,0,0"/>
+              <TextBox x:Name="txtWindow" Width="58" Text=""/>
+              <Label Content="DSCP:" Margin="10,0,0,0"/>
+              <TextBox x:Name="txtDscp" Width="52" Text="" ToolTip="QoS marking, e.g. EF, CS5, AF11 or 0-63. Note: Windows often ignores socket DSCP (see docs)."/>
+              <CheckBox x:Name="chkReverse" Content="Reverse (-R)" Margin="12,0,0,0"/>
+              <CheckBox x:Name="chkBidir" Content="Bidir (--bidir)"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Server-only options (disabled in Client mode) -->
+        <Border x:Name="grpServer" BorderBrush="#5a4a2a" BorderThickness="1" CornerRadius="4" Padding="6,4" Margin="0,0,0,2">
+          <StackPanel>
+            <TextBlock Text="SERVER OPTIONS" Foreground="#c6a86f" FontSize="10" FontWeight="Bold" Margin="0,0,0,3"/>
+            <StackPanel Orientation="Horizontal">
+              <CheckBox x:Name="chkUpnp" Content="Auto-forward (UPnP)" ToolTip="Ask the router to forward this port via UPnP so a server behind NAT is reachable"/>
+            </StackPanel>
+          </StackPanel>
+        </Border>
+
+        <!-- Common: extra args passthrough -->
+        <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
           <Label Content="Extra args:"/>
-          <TextBox x:Name="txtExtra" Width="230" Text=""/>
+          <TextBox x:Name="txtExtra" Width="420" Text="" ToolTip="Any additional iperf3 flags, passed through verbatim"/>
         </StackPanel>
-      </Grid>
+
+      </StackPanel>
     </Border>
 
     <!-- Row 1: iperf path + run/stop -->
@@ -607,19 +605,13 @@ function Set-Running([bool]$on) {
     $script:running = $on
     $script:btnRun.IsEnabled  = -not $on
     $script:btnStop.IsEnabled = $on
-    foreach ($ctl in @($rbClient,$rbServer,$rbTcp,$rbUdp,$txtHost,$txtPort,$txtTime,
-                       $txtParallel,$txtInterval,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,
-                       $chkBidir,$chkNat,$chkUpnp,$txtExtra,$txtIperf,$btnBrowse,$btnPubIp)) {
+    # Group containers (grpClient/grpServer) disable all their children via WPF
+    # IsEnabled propagation, so we only toggle the containers + the common controls.
+    foreach ($ctl in @($rbClient,$rbServer,$txtPort,$txtInterval,$chkNat,$txtExtra,
+                       $grpClient,$grpServer,$txtIperf,$btnBrowse,$btnPubIp)) {
         $ctl.IsEnabled = -not $on
     }
-    if (-not $on) {
-        # Re-apply role-based enable/disable (client-only vs server-only fields)
-        $isClient = $rbClient.IsChecked
-        foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,$chkBidir)) {
-            $ctl.IsEnabled = $isClient
-        }
-        $chkUpnp.IsEnabled = -not $isClient
-    }
+    if (-not $on) { & $script:updateRole }   # re-apply which role's group is active
 }
 
 function Build-Args {
@@ -631,11 +623,13 @@ function Build-Args {
         $a.Add('-s')
     }
     if ($txtPort.Text.Trim())     { $a.Add('-p'); $a.Add($txtPort.Text.Trim()) }
-    if ($rbUdp.IsChecked)         { $a.Add('-u') }
     if ($chkNat.IsChecked)        { $a.Add('--nat') }
     if ($txtInterval.Text.Trim()) { $a.Add('-i'); $a.Add($txtInterval.Text.Trim()) }
 
     if ($isClient) {
+        # -u (UDP) is a client-only flag in iperf3; the server auto-detects the
+        # protocol from the client, so it must never be sent in server mode.
+        if ($rbUdp.IsChecked)         { $a.Add('-u') }
         if ($txtTime.Text.Trim())     { $a.Add('-t'); $a.Add($txtTime.Text.Trim()) }
         if ($txtParallel.Text.Trim()) { $a.Add('-P'); $a.Add($txtParallel.Text.Trim()) }
         if ($txtBitrate.Text.Trim())  { $a.Add('-b'); $a.Add($txtBitrate.Text.Trim()) }
@@ -709,8 +703,9 @@ function Start-Run {
         if (-not $localIP) {
             Add-Log "UPnP: could not determine this machine's LAN IP; skipping port mapping."
         } else {
-            $protos = @('TCP')
-            if ($rbUdp.IsChecked) { $protos += 'UDP' }   # UDP tests also need the UDP port
+            # A server accepts both TCP and UDP clients, and protocol is chosen by
+            # the client, so forward both to be safe.
+            $protos = @('TCP','UDP')
             Add-Log ("UPnP: requesting router forward of port {0}/{1} -> {2} ..." -f $port, ($protos -join '+'), $localIP)
             $lblStatus.Text = 'Requesting UPnP port mapping from router...'
             $u = Add-UpnpMapping -Port $port -Protocols $protos -LocalIP $localIP -Desc 'iperf3-nat'
@@ -801,16 +796,14 @@ $btnBrowse.Add_Click({
 $graph.Add_SizeChanged({ Redraw-Graph })
 
 # Enable/disable client-only fields when role changes
-$updateRole = {
+$script:updateRole = {
     $isClient = $rbClient.IsChecked
-    foreach ($ctl in @($txtHost,$txtTime,$txtParallel,$txtBitrate,$txtLen,$txtWindow,$txtDscp,$chkReverse,$chkBidir)) {
-        $ctl.IsEnabled = $isClient
-    }
-    $chkUpnp.IsEnabled = -not $isClient   # UPnP auto-forward is a server-side action
+    $grpClient.IsEnabled = $isClient        # CLIENT OPTIONS group
+    $grpServer.IsEnabled = -not $isClient   # SERVER OPTIONS group
 }
-$rbClient.Add_Checked($updateRole)
-$rbServer.Add_Checked($updateRole)
-& $updateRole   # apply once at startup (default is client mode -> UPnP disabled)
+$rbClient.Add_Checked($script:updateRole)
+$rbServer.Add_Checked($script:updateRole)
+& $script:updateRole   # apply once at startup (default is client mode)
 
 $win.Add_Closing({
     if ($script:running) { Stop-Run 'Closing.' }

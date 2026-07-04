@@ -170,6 +170,14 @@ It auto-locates `iperf3.exe` (same folder, `..\src`, or the `dist` build); use
 `dist/iperf3-nat-windows/` alongside the exe, so the packaged build is a complete,
 self-contained bundle.
 
+The options are grouped by role: a **Common** row (Mode, Port, Interval, NAT), a
+**CLIENT OPTIONS** box, and a **SERVER OPTIONS** box. Selecting Client or Server
+enables the matching box and greys out the other, so you can't set an option that
+doesn't apply to the current role. In particular **Protocol (TCP/UDP) is a client
+choice** — an iperf3 server accepts both and auto-detects from the client, so the
+protocol selector lives under CLIENT OPTIONS and `-u` is never sent to a server
+(sending it produced iperf3's "option is client only" error).
+
 What it exposes:
 
 * **Mode** — Client or Server
